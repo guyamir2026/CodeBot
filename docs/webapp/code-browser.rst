@@ -1,7 +1,6 @@
 דפדפן קוד (Code Browser)
 =========================
-
-דפדפן הקוד מאפשר צפייה וניווט בריפוזיטורים מ-GitHub ישירות בממשק ה-WebApp.
+:summary: דפדפן הקוד מאפשר צפייה וניווט בריפוזיטורים מ-GitHub ישירות בממשק ה-WebApp.
 
 ייבוא ריפו חדש
 --------------
@@ -41,7 +40,7 @@
       * - שדה
         - ערך
       * - **Payload URL**
-        - ``https://<הדומיין של קודבוט>/api/webhooks/github``
+        - ``https://<הדומיין של ה-וובאפפ>/api/webhooks/github``
       * - **Content type**
         - ``application/json``
       * - **Secret**

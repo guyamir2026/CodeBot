@@ -148,6 +148,7 @@ from conversation_handlers import set_activity_reporter as set_ch_activity_repor
 # ייבוא דחוי של ה-activity_reporter בתוך ה-run-time בלבד כדי למנוע יצירת חיבורים בזמן import
 from github_menu_handler import GitHubMenuHandler
 from backup_menu_handler import BackupMenuHandler
+from skill_menu_handler import SkillMenuHandler
 from handlers.drive.menu import GoogleDriveMenuHandler
 from handlers.drive.utils import extract_schedule_key as drive_extract_schedule_key
 def get_drive_handler_from_application(application: Application) -> tuple[Any, bool]:
@@ -777,6 +778,90 @@ async def _send_direct_admins(context: ContextTypes.DEFAULT_TYPE, text: str) -> 
         return False
 
 
+async def connect_claude_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """מנפיק טוקן אישי (PAT) לחיבור הקבצים של המשתמש ל‑Claude דרך MCP (קריאה בלבד)."""
+    try:
+        message = update.message or update.effective_message
+        if message is None:
+            return
+
+        # אבטחה: הטוקן סודי — מנפיקים רק בצ'אט פרטי כדי שלא ידלוף בקבוצה.
+        chat = update.effective_chat
+        if getattr(chat, "type", "private") != "private":
+            await message.reply_text("🔒 הפקודה זמינה בצ'אט פרטי בלבד (הטוקן סודי).")
+            return
+
+        user = update.effective_user
+        user_id = getattr(user, "id", None)
+        if not user_id:
+            await message.reply_text("לא זוהה משתמש.")
+            return
+
+        # ‎/connect_claude write‎ מנפיק טוקן עם הרשאת כתיבה; בלי ארגומנט — קריאה בלבד.
+        want_write = any(str(a).strip().lower() == "write" for a in (context.args or []))
+        scopes = ("read", "write") if want_write else ("read",)
+        label = "Claude (write)" if want_write else "Claude"
+
+        raw = None
+        try:
+            from src.infrastructure.composition.webapp_container import get_files_facade
+
+            raw = get_files_facade().issue_mcp_token(int(user_id), label=label, scopes=scopes)
+        except Exception:
+            logger.error("connect_claude: token issue failed", exc_info=True)
+            raw = None
+
+        if not raw:
+            await message.reply_text("אירעה שגיאה ביצירת הטוקן. נסו שוב מאוחר יותר.")
+            return
+
+        base = (os.getenv("MCP_SERVER_URL") or "https://YOUR-MCP-HOST").rstrip("/")
+        add_cmd = (
+            f'claude mcp add --transport http codekeeper {base}/mcp '
+            f'--header "Authorization: Bearer {raw}"'
+        )
+        if want_write:
+            access_line = (
+                "⚠️ אל תשתפו את הטוקן — הוא נותן גישת <b>קריאה וכתיבה</b> "
+                "(יצירה/עדכון קבצים) למאגר שלכם."
+            )
+        else:
+            access_line = (
+                "⚠️ אל תשתפו את הטוקן — הוא נותן גישת <b>קריאה בלבד</b> לקבצים שלכם.\n"
+                "✍️ לטוקן עם הרשאת כתיבה (יצירה/עדכון) שלחו <code>/connect_claude write</code>."
+            )
+        text = (
+            "🔌 <b>חיבור הקבצים שלך ל‑Claude (MCP)</b>\n\n"
+            "הטוקן האישי שלך (יוצג פעם אחת בלבד — שמור אותו):\n"
+            f"<code>{raw}</code>\n\n"
+            "לחיבור מ‑Claude Code / Desktop (העתק‑הדבק):\n"
+            f"<code>{add_cmd}</code>\n\n"
+            "💡 ל‑Claude.ai <b>אין צורך בטוקן</b>: ב‑Settings → Connectors → "
+            "Add custom connector הזינו את הכתובת\n"
+            f"<code>{base}/mcp</code>\n"
+            "וההתחברות תתבצע אוטומטית (דרך התחברות טלגרם).\n\n"
+            f"{access_line}"
+        )
+        try:
+            await message.reply_text(text, parse_mode=ParseMode.HTML)
+        except Exception:
+            # נפילת פרסום HTML לא תגרום לאובדן הטוקן — שולחים גרסת טקסט.
+            plain = (
+                text.replace("<b>", "")
+                .replace("</b>", "")
+                .replace("<code>", "")
+                .replace("</code>", "")
+            )
+            await message.reply_text(plain)
+    except Exception:
+        logger.error("connect_claude_command failed", exc_info=True)
+        try:
+            if update and update.message:
+                await update.message.reply_text("אירעה שגיאה. נסו שוב מאוחר יותר.")
+        except Exception:
+            pass
+
+
 async def admin_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """קבלת דיווח משתמש ושליחה לאדמינים."""
     try:
@@ -822,6 +907,149 @@ async def admin_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text("לא הצלחתי לשלוח את הדיווח כרגע.")
         except Exception:
             pass
+
+# ===== Admin: חסימת משתמשים =====
+
+
+def _require_admin(update: Update) -> int | None:
+    """מחזיר את מזהה האדמין, או ``None`` אם הקורא אינו אדמין."""
+    try:
+        user_id = int(update.effective_user.id) if update and update.effective_user else 0
+    except Exception:
+        return None
+    admin_ids = get_admin_ids()
+    if not admin_ids or user_id not in admin_ids:
+        return None
+    return user_id
+
+
+def _parse_target_id(args: list[str] | None) -> int | None:
+    """המזהה המספרי מהארגומנט הראשון.
+
+    רק מזהה מספרי. ``@username`` אינו נתמך בכוונה: הפיכת שם משתמש
+    למזהה דורשת קריאה ל-API שיכולה להיכשל בשקט ולהחזיר את המזהה
+    הלא נכון — וחסימה של המשתמש הלא נכון גרועה מלא לחסום.
+    """
+    if not args:
+        return None
+    raw = str(args[0]).strip()
+    if not raw.isdigit():
+        return None
+    value = int(raw)
+    return value if value > 0 else None
+
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """חוסם משתמש. שימוש: ``/ban <user_id> [סיבה]``"""
+    message = update.message or update.effective_message
+    if message is None:
+        return
+    admin_id = _require_admin(update)
+    if admin_id is None:
+        await message.reply_text("❌ פקודה זמינה למנהלים בלבד")
+        return
+
+    args = list(getattr(context, "args", None) or [])
+    target = _parse_target_id(args)
+    if target is None:
+        await message.reply_text(
+            "שימוש: /ban <user_id> [סיבה]\n"
+            "לדוגמה: /ban 123456789 ספאם\n\n"
+            "נדרש מזהה מספרי, לא @username."
+        )
+        return
+
+    from database import blocked_users_manager as bum
+
+    if target in get_admin_ids():
+        await message.reply_text("❌ אי אפשר לחסום אדמין")
+        return
+
+    reason = " ".join(args[1:]).strip()
+    if bum.block_user(target, reason=reason, blocked_by=admin_id):
+        # ה-Application נבנה עם Defaults(parse_mode=HTML), ולכן כל
+        # reply_text מפורש כ-HTML גם בלי parse_mode מפורש. סיבה כמו
+        # "a<b" הייתה מפילה את ההודעה ב-BadRequest, והאדמין היה רואה
+        # חסימה שנשמרה ב-DB בלי אישור.
+        suffix = f"\nסיבה: {html_escape(reason)}" if reason else ""
+        await message.reply_text(f"✅ {target} נחסם.{suffix}")
+    else:
+        await message.reply_text("❌ החסימה נכשלה — בסיס הנתונים לא זמין. ראו לוגים.")
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """משחרר משתמש. שימוש: ``/unban <user_id>``"""
+    message = update.message or update.effective_message
+    if message is None:
+        return
+    if _require_admin(update) is None:
+        await message.reply_text("❌ פקודה זמינה למנהלים בלבד")
+        return
+
+    target = _parse_target_id(list(getattr(context, "args", None) or []))
+    if target is None:
+        await message.reply_text("שימוש: /unban <user_id>")
+        return
+
+    from database import blocked_users_manager as bum
+
+    # ההודעה הזו קיימת כדי שהמפעיל לא ינסה שוב ושוב. ``BLOCKED_USER_IDS``
+    # הוא רשת ביטחון שמנוהלת ב-Render בלבד, ולכן שחרור ממנה אינו אפשרי
+    # מכאן — וכישלון שקט היה נראה כמו באג.
+    if target in bum.env_blocked_ids():
+        await message.reply_text(
+            f"⚠️ {target} חסום דרך BLOCKED_USER_IDS ולא דרך בסיס הנתונים.\n"
+            "השחרור נעשה בהסרתו מהמשתנה ב-Render."
+        )
+        return
+
+    if bum.unblock_user(target):
+        await message.reply_text(f"✅ {target} שוחרר.")
+    else:
+        await message.reply_text(f"ℹ️ {target} לא היה חסום (או שבסיס הנתונים לא זמין).")
+
+
+async def blocked_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """מציג את החסומים. שימוש: ``/blocked``"""
+    message = update.message or update.effective_message
+    if message is None:
+        return
+    if _require_admin(update) is None:
+        await message.reply_text("❌ פקודה זמינה למנהלים בלבד")
+        return
+
+    from database import blocked_users_manager as bum
+
+    lines: list[str] = []
+    env_ids = sorted(bum.env_blocked_ids())
+    if env_ids:
+        lines.append("🔒 מ-BLOCKED_USER_IDS (לא ניתן לשחרר מכאן):")
+        lines.extend(f"  • {uid}" for uid in env_ids)
+
+    rows = bum.list_blocked()
+    if rows:
+        if lines:
+            lines.append("")
+        lines.append("📋 מבסיס הנתונים:")
+        for row in rows:
+            uid = row.get("user_id")
+            # escaping חובה: בלעדיו רשומה אחת עם "<" הייתה משביתה את
+            # /blocked לגמרי, עד שמישהו יסיר אותה ידנית מה-DB.
+            reason = html_escape(str(row.get("reason") or "").strip())
+            when = row.get("blocked_at")
+            when_text = when.strftime("%Y-%m-%d") if hasattr(when, "strftime") else ""
+            parts = [f"  • {uid}"]
+            if when_text:
+                parts.append(f"({when_text})")
+            if reason:
+                parts.append(f"— {reason}")
+            lines.append(" ".join(parts))
+
+    # עד 100 רשומות עם סיבות חופשיות עוברות בקלות את מגבלת 4096 התווים.
+    text = "\n".join(lines) if lines else "אין משתמשים חסומים."
+    for chunk in _split_long_message(text):
+        await message.reply_text(chunk)
+
 
 # ===== Admin: /recycle_backfill =====
 async def recycle_backfill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2110,6 +2338,12 @@ class HelpSection(TypedDict):
 
 HELP_SECTIONS: list[HelpSection] = [
     {
+        "title": "🔌 <b>חיבור ל‑Claude (MCP)</b>",
+        "entries": [
+            {"commands": ("connect_claude",), "description": "חיבור הקבצים שלך ל‑Claude (טוקן MCP)"},
+        ],
+    },
+    {
         "title": "🔔 <b>תזכורות</b>",
         "entries": [
             {"commands": ("remind",), "description": "יצירת תזכורת חכמה"},
@@ -3217,6 +3451,24 @@ class CodeKeeperBot:
             except Exception:
                 user_id = 0
             if user_id:
+                # חסימת משתמשים – לפני כל השאר, כולל לפני עקיפת האדמין.
+                # is_blocked מחזיר False לאדמין בעצמו, ולכן אין כאן סכנה
+                # לנעול את מי שאמור לשחרר; מה שכן, ספאמר חסום לא צריך
+                # לצרוך את מכסת הקצב ולא להגיע לשום handler.
+                #
+                # חסימה שקטה בכוונה: הודעה למשתמש החסום מזמינה ויכוח
+                # ומאשרת לו שהוא זוהה.
+                try:
+                    from database.blocked_users_manager import is_blocked as _is_blocked
+
+                    if await _is_blocked(user_id):
+                        raise ApplicationHandlerStop
+                except ApplicationHandlerStop:
+                    raise
+                except Exception:
+                    # תקלה בבדיקה עצמה לא חוסמת – fail-open, כמו במגביל הקצב.
+                    logger.debug("בדיקת חסימה נכשלה, ממשיכים", exc_info=True)
+
                 # עקיפת אדמין – אדמינים לא מוגבלים ע"י השער הגלובלי
                 try:
                     admins = get_admin_ids()
@@ -3397,11 +3649,16 @@ class CodeKeeperBot:
             await backup_handler.show_backup_menu(update, context)
         self.application.add_handler(CommandHandler("backup", show_backup_menu))
         self.application.add_handler(CallbackQueryHandler(backup_handler.handle_callback_query, pattern=r'^(backup_|backup_add_note:.*)'))
+
+        # יצירת SkillMenuHandler ורישום ה-callbacks שלו (סוג קובץ "סקיל" — אחסון נפרד מגיבויים)
+        skill_handler = SkillMenuHandler()
+        self.application.bot_data['skill_handler'] = skill_handler
+        self.application.add_handler(CallbackQueryHandler(skill_handler.handle_callback_query, pattern=r'^skill_'))
         
         # הוסף את ה-callbacks של GitHub - חשוב! לפני ה-handler הגלובלי
         self.application.add_handler(
                         CallbackQueryHandler(github_handler.handle_menu_callback, 
-                               pattern=r'^(select_repo|upload_file|upload_saved|show_current|set_token|set_folder|close_menu|folder_|repo_|repos_page_|upload_saved_|back_to_menu|repo_manual|noop|analyze_repo|analyze_current_repo|analyze_other_repo|show_suggestions|show_full_analysis|gh_download_analysis_json|download_analysis_json|back_to_analysis|back_to_analysis_menu|back_to_summary|choose_my_repo|enter_repo_url|suggestion_\d+|github_menu|logout_github|gh_delete_file_menu|gh_delete_repo_menu|delete_file_menu|delete_repo_menu|gh_confirm_delete_repo|confirm_delete_repo|gh_confirm_delete_repo_step1|confirm_delete_repo_step1|gh_confirm_delete_file|confirm_delete_file|danger_delete_menu|gh_download_file_menu|download_file_menu|browse_repo|browse_open:.*|browse_select_download:.*|browse_select_delete:.*|browse_page:.*|download_zip:.*|download_zip_i:.*|multi_toggle|multi_execute|multi_clear|safe_toggle|browse_toggle_select:.*|inline_download_file:.*|view_more|view_back|browse_select_view:.*|browse_ref_menu|browse_refs_branches_page_.*|browse_refs_tags_page_.*|browse_select_ref:.*|browse_search|browse_search_page:.*|notifications_menu|notifications_toggle|notifications_toggle_pr|notifications_toggle_issues|notifications_interval_.*|notifications_check_now|notifications_sentry_test|share_folder_link:.*|share_selected_links|pr_menu|create_pr_menu|branches_page_.*|pr_select_head:.*|confirm_create_pr|merge_pr_menu|prs_page_.*|merge_pr:.*|confirm_merge_pr|validate_repo|git_checkpoint|git_checkpoint_doc:.*|git_checkpoint_doc_skip|restore_checkpoint_menu|restore_tags_page_.*|restore_select_tag:.*|restore_branch_from_tag:.*|restore_revert_pr_from_tag:.*|restore_commit_menu|restore_commits_page_.*|restore_select_commit:.*|restore_branch_from_commit:.*|restore_revert_pr_from_commit:.*|rcb:.*|rcpr:.*|open_pr_from_branch:.*|choose_upload_branch|upload_branches_page_.*|upload_select_branch:.*|upload_select_branch_tok:.*|choose_upload_folder|upload_select_folder:.*|upload_folder_root|upload_folder_current|upload_folder_custom|upload_folder_create|create_folder|confirm_saved_upload|refresh_saved_checks|github_backup_menu|github_backup_help|github_backup_db_list|github_restore_zip_to_repo|github_restore_zip_setpurge:.*|github_restore_zip_list|github_restore_zip_from_backup:.*|github_repo_restore_backup_setpurge:.*|gh_upload_cat:.*|gh_upload_repo:.*|gh_upload_large:.*|backup_menu|github_create_repo_from_zip|github_new_repo_name|github_set_new_repo_visibility:.*|upload_paste_code|cancel_paste_flow|gh_upload_zip_browse:.*|gh_upload_zip_page:.*|gh_upload_zip_select:.*|gh_upload_zip_select_idx:.*|gh_upload_zip_all:.*|backup_add_note:.*|github_import_repo|import_repo_branches_page_.*|import_repo_select_branch:.*|import_repo_start|import_repo_cancel)')
+                               pattern=r'^(select_repo|upload_file|upload_saved|show_current|set_token|set_folder|close_menu|folder_|repo_|repos_page_|upload_saved_|back_to_menu|repo_manual|noop|analyze_repo|analyze_current_repo|analyze_other_repo|show_suggestions|show_full_analysis|gh_download_analysis_json|download_analysis_json|back_to_analysis|back_to_analysis_menu|back_to_summary|choose_my_repo|enter_repo_url|suggestion_\d+|github_menu|logout_github|gh_delete_file_menu|gh_delete_repo_menu|delete_file_menu|delete_repo_menu|gh_confirm_delete_repo|confirm_delete_repo|gh_confirm_delete_repo_step1|confirm_delete_repo_step1|gh_confirm_delete_file|confirm_delete_file|danger_delete_menu|gh_download_file_menu|download_file_menu|browse_repo|browse_open:.*|browse_select_download:.*|browse_select_delete:.*|browse_page:.*|download_zip:.*|download_zip_i:.*|ghzip_dest_skill:.*|ghzip_dest_backup:.*|ghzip_name_default:.*|ghzip_name_custom:.*|ghzip_cancel:.*|multi_toggle|multi_execute|multi_clear|safe_toggle|browse_toggle_select:.*|inline_download_file:.*|view_more|view_back|browse_select_view:.*|browse_ref_menu|browse_refs_branches_page_.*|browse_refs_tags_page_.*|browse_select_ref:.*|browse_search|browse_search_page:.*|notifications_menu|notifications_toggle|notifications_toggle_pr|notifications_toggle_issues|notifications_interval_.*|notifications_check_now|notifications_sentry_test|share_folder_link:.*|share_selected_links|pr_menu|create_pr_menu|branches_page_.*|pr_select_head:.*|confirm_create_pr|merge_pr_menu|prs_page_.*|merge_pr:.*|confirm_merge_pr|validate_repo|git_checkpoint|git_checkpoint_doc:.*|git_checkpoint_doc_skip|restore_checkpoint_menu|restore_tags_page_.*|restore_select_tag:.*|restore_branch_from_tag:.*|restore_revert_pr_from_tag:.*|restore_commit_menu|restore_commits_page_.*|restore_select_commit:.*|restore_branch_from_commit:.*|restore_revert_pr_from_commit:.*|rcb:.*|rcpr:.*|open_pr_from_branch:.*|choose_upload_branch|upload_branches_page_.*|upload_select_branch:.*|upload_select_branch_tok:.*|choose_upload_folder|upload_select_folder:.*|upload_folder_root|upload_folder_current|upload_folder_custom|upload_folder_create|create_folder|confirm_saved_upload|refresh_saved_checks|github_backup_menu|github_backup_help|github_backup_db_list|github_restore_zip_to_repo|github_restore_zip_setpurge:.*|github_restore_zip_list|github_restore_zip_from_backup:.*|github_repo_restore_backup_setpurge:.*|gh_upload_cat:.*|gh_upload_repo:.*|gh_upload_large:.*|backup_menu|github_create_repo_from_zip|github_zip_to_folder|zipdir_use_current|zipdir_custom|zipdir_confirm|github_new_repo_name|github_set_new_repo_visibility:.*|upload_paste_code|cancel_paste_flow|gh_upload_zip_browse:.*|gh_upload_zip_page:.*|gh_upload_zip_select:.*|gh_upload_zip_select_idx:.*|gh_upload_zip_all:.*|backup_add_note:.*|github_import_repo|import_repo_branches_page_.*|import_repo_select_branch:.*|import_repo_start|import_repo_cancel)')
             )
 
         # הוסף את ה-callbacks של Google Drive
@@ -3426,6 +3683,7 @@ class CodeKeeperBot:
                 pass
             return ConversationHandler.END
 
+        # docs:upload-conv:start — הקטע מוטמע בתיעוד (docs/conversation-handlers.rst); אל תסיר את הסימון
         upload_conv_handler = ConversationHandler(
             entry_points=[
                 CallbackQueryHandler(github_handler.handle_menu_callback, pattern='^upload_file$')
@@ -3446,6 +3704,7 @@ class CodeKeeperBot:
                 CallbackQueryHandler(_upload_cancel, pattern=r'^cancel$')
             ]
         )
+        # docs:upload-conv:end
         
         self.application.add_handler(upload_conv_handler)
         
@@ -3474,30 +3733,53 @@ class CodeKeeperBot:
                 context.user_data.pop('waiting_for_selected_folder', None)
                 context.user_data.pop('waiting_for_new_folder_path', None)
                 context.user_data.pop('waiting_for_upload_folder', None)
+                # יציאה דרך התפריט הראשי חייבת לנקות גם את מצב פריסת ה-ZIP,
+                # אחרת ההודעה הבאה תתפרש כנתיב תיקייה ותפתח מסך אישור לריפו
+                context.user_data.pop('waiting_for_zipdir_folder', None)
+                context.user_data.pop('zip_to_folder_target', None)
+                context.user_data.pop('zip_to_folder_repo', None)
+                # אותו טעם: בלי הניקוי, ההודעה הבאה הייתה נקלטת כשם לזיפ ישן
+                # ומשלימה אותו בטעות
+                context.user_data.pop('waiting_for_zip_custom_name', None)
                 context.user_data.pop('return_to_pre_upload', None)
                 # נקה גם דגלי "הדבק קוד" כדי לצאת יפה מהזרימה
                 context.user_data.pop('waiting_for_paste_content', None)
                 context.user_data.pop('waiting_for_paste_filename', None)
                 context.user_data.pop('paste_content', None)
                 return False
-            # זרימת הוספת הערה לגיבוי (משותפת ל-GitHub/Backup)
-            if context.user_data.get('waiting_for_backup_note_for'):
-                backup_id = context.user_data.pop('waiting_for_backup_note_for')
+            # זרימת הוספת הערה — מנגנון גנרי משותף לגיבוי ולסקיל (נבדלים רק ביעד כפתור החזרה)
+            async def _handle_note_input(entity_id: str, back_cb: str) -> bool:
                 try:
                     from database import db
-                    ok = db.save_backup_note(update.effective_user.id, backup_id, (text or '')[:1000])
+                    # קריאת DB חוסמת — רצה ב-thread כדי לא לחסום את לולאת האירועים
+                    ok = await asyncio.to_thread(
+                        db.save_backup_note, update.effective_user.id, entity_id, (text or '')[:1000]
+                    )
                     if ok:
                         await update.message.reply_text(
                             "✅ ההערה נשמרה!",
-                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data=f"backup_details:{backup_id}")]])
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data=f"{back_cb}:{entity_id}")]])
                         )
                         # מנע הודעת "נראה שזה קטע קוד!" עבור ההודעה הזו
                         context.user_data['suppress_code_hint_once'] = True
                     else:
                         await update.message.reply_text("❌ שמירת ההערה נכשלה")
-                except Exception as e:
-                    await update.message.reply_text(f"❌ שגיאה בשמירת ההערה: {e}")
+                except Exception:
+                    logger.exception("שמירת הערה נכשלה")
+                    await update.message.reply_text("❌ שמירת ההערה נכשלה, נסה שוב מאוחר יותר")
                 return True
+
+            if context.user_data.get('waiting_for_backup_note_for'):
+                return await _handle_note_input(
+                    context.user_data.pop('waiting_for_backup_note_for'), "backup_details"
+                )
+            if context.user_data.get('waiting_for_skill_note_for'):
+                return await _handle_note_input(
+                    context.user_data.pop('waiting_for_skill_note_for'), "skill_details"
+                )
+            # קלט נתיב תיקייה לפריסת ZIP (zipdir_custom)
+            if context.user_data.get('waiting_for_zipdir_folder'):
+                return await github_handler.handle_text_input(update, context)
             # קלט נתיב יעד ידני לסביבת העלאה (upload_folder_custom)
             if context.user_data.get('waiting_for_upload_folder'):
                 # ניתוב טקסט למטפל טקסטים של GitHub (סמנטי ונקי)
@@ -3512,6 +3794,7 @@ class CodeKeeperBot:
                context.user_data.get('waiting_for_new_folder_path') or \
                context.user_data.get('waiting_for_paste_content') or \
                context.user_data.get('waiting_for_paste_filename') or \
+               context.user_data.get('waiting_for_zip_custom_name') or \
                context.user_data.get('browse_search_mode'):
                 logger.info(f"🔗 Routing GitHub-related text input from user {update.effective_user.id}")
                 return await github_handler.handle_text_input(update, context)
@@ -3823,6 +4106,10 @@ class CodeKeeperBot:
         self.application.add_handler(CommandHandler("stats", self.stats_command))
         self.application.add_handler(CommandHandler("check", self.check_commands))
         self.application.add_handler(CommandHandler("admin", admin_report_command))
+        self.application.add_handler(CommandHandler("ban", ban_command))
+        self.application.add_handler(CommandHandler("unban", unban_command))
+        self.application.add_handler(CommandHandler("blocked", blocked_command))
+        self.application.add_handler(CommandHandler("connect_claude", connect_claude_command))
 
         # ChatOps: /jobs (Background Jobs Monitor)
         async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4380,6 +4667,16 @@ class CodeKeeperBot:
             logger.debug("handle_text_message: missing text payload, ignoring")
             return
         text = message_text
+
+        # מצב "בחירת שם ל-ZIP" — הופעל אחרי לחיצה על 'סיום' בזרימת יצירת ZIP.
+        # נבדק ראשון כדי שהשם לא ייבלע/ייחשב כקוד (הטקסט נופל לכאן במצב הזה).
+        if context.user_data.pop('awaiting_zip_name', False):
+            try:
+                from conversation_handlers import finalize_zip_create
+                await finalize_zip_create(update, context, zip_name=text)
+            except Exception as _zip_err:
+                logger.exception("zip name finalize failed: %s", _zip_err)
+            return
 
         # מצב חיפוש אינטראקטיבי (מופעל מהכפתור "🔎 חפש קובץ")
         if context.user_data.get('awaiting_search_text'):
@@ -5306,6 +5603,17 @@ async def setup_bot_data(application: Application) -> None:  # noqa: D401
     except Exception:
         # Fail-open: אל תכשיל startup אם מודול הניטור לא זמין
         pass
+
+    # אינדקסי טבלת החסימות. בלי זה אין אינדקס ייחודי על user_id, ושני
+    # /ban מקבילים על אותו משתמש היו יוצרים שתי רשומות. pymongo סינכרוני,
+    # ולכן to_thread כדי לא לחסום את העלייה.
+    try:
+        from database.blocked_users_manager import ensure_indexes as _ensure_blocked_indexes
+
+        await asyncio.to_thread(_ensure_blocked_indexes)
+    except Exception:
+        # Fail-open: DB לא זמין בעלייה אינו סיבה להפיל את הבוט.
+        logger.debug("blocked_users: יצירת האינדקסים בעלייה נכשלה", exc_info=True)
 
     # Semantic search embedding worker (best-effort)
     if getattr(config, "SEMANTIC_SEARCH_ENABLED", True):

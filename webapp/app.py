@@ -15,14 +15,15 @@ import mimetypes
 import uuid
 import inspect
 import socket
+
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from functools import wraps, lru_cache
 from types import SimpleNamespace
-from typing import Optional, Dict, Any, List, Tuple, Set
+from typing import Optional, Dict, Any, List, Tuple, Set, Union
 from concurrent.futures import ThreadPoolExecutor, Future
 
 from flask import Flask, Blueprint, render_template, jsonify, request, session, redirect, url_for, send_file, abort, Response, g, flash, make_response, send_from_directory
+from markupsafe import Markup
 import threading
 import atexit
 import time as _time
@@ -169,6 +170,10 @@ except Exception:
 
 # מייבא לאחר הוספת ROOT_DIR ל-PYTHONPATH כדי למנוע כשל ייבוא בדיפלוי
 from http_sync import request as http_request  # noqa: E402
+
+# תקרת אורך פתק, לשימוש בתבניות. חייב לשבת כאן ולא בראש הקובץ —
+# ראו tests/test_webapp_import_paths.py, ששומר על הכלל ונופל אם הוא מופר.
+from sticky_notes_target import MAX_NOTE_CHARS as MAX_NOTE_CHARS_FOR_TEMPLATES  # noqa: E402
 
 # נרמול טקסט/קוד לפני שמירה (הסרת תווים נסתרים, כיווניות, אחידות שורות)
 from utils import normalize_code, TimeUtils, detect_language_from_filename  # noqa: E402
@@ -1235,6 +1240,30 @@ except Exception:
     # אל תפיל את היישום אם ה-Blueprint אינו זמין (למשל בסביבת דוקס/CI)
     pass
 
+# Note Boards API (לוחות פתקים — פתקים שאינם צמודים לקובץ).
+# ראוטי הפתקים של הלוח יושבים ב-sticky_notes_bp שלמעלה; כאן רק הלוחות עצמם.
+try:
+    from webapp.note_boards_api import note_boards_bp  # noqa: E402
+    app.register_blueprint(note_boards_bp)
+except Exception as _e:
+    # לא מפילים את היישום (סביבות דוקס/CI ללא תלויות), אבל גם לא בולעים
+    # בשקט: רישום שנכשל פירושו שהפיצ'ר פשוט לא קיים, וזה חייב להיראות
+    # בלוג ברמת error ולא להתגלות כ-404 מסתורי.
+    try:
+        logger.error("note_boards_api blueprint not registered: %s", _e, exc_info=True)
+    except Exception:
+        pass
+
+# Note Boards UI (עמודי הלוחות עצמם)
+try:
+    from webapp.boards_ui import boards_ui  # noqa: E402
+    app.register_blueprint(boards_ui)
+except Exception as _e:
+    try:
+        logger.error("boards_ui blueprint not registered: %s", _e, exc_info=True)
+    except Exception:
+        pass
+
 # Web Push API (public key + subscribe/unsubscribe)
 try:
     from webapp.push_api import push_bp, start_sender_if_enabled  # noqa: E402
@@ -1534,11 +1563,35 @@ try:
             install_sensitive_filter()
         except Exception:
             pass
+        def _sentry_before_send(event, hint):
+            """מנקה טוקני בוט מכל אירוע לפני שהוא נשלח ל-Sentry.
+
+            הלוגיקה המשותפת (ניקוי עמוק + fail-closed) חיה
+            ב-telegram_api.scrub_sentry_event — אותה נקודה שגם הבוט משתמש בה.
+            """
+            try:
+                from telegram_api import scrub_sentry_event  # type: ignore
+
+                event = scrub_sentry_event(event)
+            except Exception:
+                event = None
+            if event is None:
+                try:
+                    logger.warning("sentry event dropped: token redaction failed", extra={"event": "sentry_redaction_failed"})
+                except Exception:  # nosec B110 — הגנה על מסלול הדיווח עצמו; האירוע כבר הופל
+                    pass
+                return None
+            return event
+
         sentry_sdk.init(
             dsn=getattr(__import__('config'), 'config').SENTRY_DSN,
             integrations=[FlaskIntegration()],
             traces_sample_rate=0.05,
             environment=getattr(__import__('config'), 'config').ENVIRONMENT,
+            before_send=_sentry_before_send,
+            # ה-spans של transactions נושאים כתובות HTTP מלאות (כולל טוקן ב-URL)
+            # ואינם עוברים דרך before_send — מנקים אותם באותו מסלול fail-closed
+            before_send_transaction=_sentry_before_send,
         )
 except Exception:
     pass
@@ -1999,11 +2052,20 @@ def inject_globals():
 
     ui_theme_custom_id = custom_theme_id if theme == "custom" else ""
 
+    # גופן הפתקים. ``fail-soft`` כמו שאר ההזרקה כאן: תקלה בהכרעה מחזירה
+    # ברירת מחדל ואינה מפילה רינדור של כל עמוד באתר.
+    try:
+        note_fonts, note_fonts_scope = _resolve_note_fonts(user_id, user_doc)
+    except Exception:
+        note_fonts, note_fonts_scope = _note_fonts_default(), THEME_SCOPE_GLOBAL
+
     return {
         'bot_username': BOT_USERNAME_CLEAN,
         'ui_font_scale': font_scale,
         'ui_theme': theme,
         'ui_theme_scope': theme_scope,
+        'note_fonts': note_fonts,
+        'note_fonts_scope': note_fonts_scope,
         'ui_theme_custom_id': ui_theme_custom_id,
         'custom_theme': custom_theme,
         'shared_theme': shared_theme,
@@ -2022,6 +2084,9 @@ def inject_globals():
         'static_version': static_ver,
         # קישור לתיעוד (לשימוש בתבניות)
         'documentation_url': DOCUMENTATION_URL,
+        # תקרת אורך פתק — מגיעה ל-JS מכאן ולא מוקלדת שם. בלי זה היו שני
+        # מספרים שמסונכרנים בתקווה, ופער ביניהם נראה למשתמש כחיתוך בלי הסבר.
+        'max_note_chars': MAX_NOTE_CHARS_FOR_TEMPLATES,
         # External uptime config for templates (non-sensitive only)
         'uptime_provider': UPTIME_PROVIDER,
         'uptime_status_url': UPTIME_STATUS_URL,
@@ -2063,6 +2128,108 @@ from webapp.ui_theme_defaults import get_default_ui_theme_parts, get_default_ui_
 def _normalize_theme_scope(value: Optional[str]) -> str:
     v = str(value or "").strip().lower()
     return v if v in _THEME_SCOPE_VALUES else THEME_SCOPE_GLOBAL
+
+
+# ─── גופן הפתקים, לפי משטח ──────────────────────────────────────────────
+#
+# שלושת המשטחים שמארחים פתקים. **הסדר הזה הוא הקידוד ל-cookie**, ולכן
+# ``NOTE_FONT_SURFACES`` הוא המקום **היחיד** בקוד שיודע אותו: הקידוד
+# והפענוח שניהם נגזרים ממנו, ומשטח רביעי בעתיד **נספח בסוף** ולא נדחף
+# באמצע. צימוד משמעות למיקום הוא בדיוק מה שנשך ב-``MD_INLINE_RE``, שם
+# הוספה באמצע הייתה מזיזה בשקט את כל האינדקסים שאחריה.
+NOTE_FONT_SURFACES = ("repo", "md", "board")
+
+# ``[01]{3}`` ולא JSON: הכתיבה ל-cookie למטה מאמתת כל ערך מול
+# ``re.fullmatch`` כהקשחה מול CodeQL, בדיוק כמו ``font_scale`` ו-``theme``.
+# שלושה ביטים הם הערך הצר ביותר שאפשר לאמת ב-regex יחיד.
+_NOTE_FONTS_COOKIE_RE = re.compile(r"[01]{%d}" % len(NOTE_FONT_SURFACES))
+
+
+def _note_fonts_default() -> Dict[str, bool]:
+    return {name: False for name in NOTE_FONT_SURFACES}
+
+
+def _encode_note_fonts(fonts: Optional[Dict[str, Any]]) -> str:
+    """dict ← מחרוזת ביטים, לפי ``NOTE_FONT_SURFACES``."""
+    src = fonts if isinstance(fonts, dict) else {}
+    return "".join("1" if src.get(name) else "0" for name in NOTE_FONT_SURFACES)
+
+
+def _decode_note_fonts(raw: Optional[str]) -> Optional[Dict[str, bool]]:
+    """מחרוזת ביטים ← dict. ``None`` כשהערך אינו תקין — לא זריקה.
+
+    מוחזר ``None`` ולא ברירת מחדל, כדי שהקורא יבחין בין "המכשיר הזה לא
+    אמר כלום" לבין "המכשיר הזה אמר: הכל רגיל". ההבחנה הזו היא כל ההבדל
+    בהכרעת התחולה: הראשון נופל ל-DB, השני גובר עליו.
+    """
+    val = str(raw or "").strip()
+    if not _NOTE_FONTS_COOKIE_RE.fullmatch(val):
+        return None
+    return {name: val[i] == "1" for i, name in enumerate(NOTE_FONT_SURFACES)}
+
+
+def _resolve_note_fonts(
+    user_id: Optional[int],
+    user_doc: Optional[Dict[str, Any]],
+) -> tuple[Dict[str, bool], str]:
+    """מחזיר ``(fonts, scope)`` — ערך המכשיר גובר רק במצב ``device``.
+
+    זו אותה הכרעה בדיוק שמבצע ``_resolve_theme_raw_token`` עבור ערכת
+    הנושא: cookie של המכשיר גובר **רק** כשה-cookie של התחולה אומר
+    ``device``; בכל מקרה אחר ה-DB הוא המקור. במצב ``device`` הערך אינו
+    נכתב ל-DB כלל, ולכן טאבלט וטלפון אינם דורסים זה את זה.
+
+    ``_resolve_theme_raw_token`` **לא** עבר לכאן במכוון — זה היה מרחיב
+    דיף של פיצ'ר לנגיעה במסלול הערכות. הוא המקור לצורה, לא נצרך ממנה.
+    """
+    scope = _normalize_theme_scope(request.cookies.get('ui_note_fonts_scope'))
+    device_fonts = _decode_note_fonts(request.cookies.get('ui_note_fonts'))
+
+    if scope == THEME_SCOPE_DEVICE and device_fonts is not None:
+        return device_fonts, scope
+
+    # שליפה עצלה **רק** כשההכרעה הגיעה לכאן: במצב ``device`` עם ערך תקין
+    # אין קריאה למסד כלל. ``_resolve_theme_raw_token`` עושה בדיוק את זה.
+    if user_id and user_doc is None:
+        try:
+            user_doc = get_db().users.find_one(
+                {'user_id': int(user_id)}, {'ui_prefs.note_fonts': 1}
+            ) or {}
+        except Exception:
+            user_doc = None
+
+    if user_id and isinstance(user_doc, dict):
+        stored = (user_doc.get('ui_prefs') or {}).get('note_fonts')
+        if isinstance(stored, dict):
+            # ``is True`` ולא ``bool()``: ``bool("false")`` הוא ``True``, וכך
+            # מסמך שנערך ביד או שנכתב לפני שהוולידציה נוספה היה מדליק את
+            # הגופן דווקא כשהערך אומר את ההפך. הוולידציה ב-``/api/ui_prefs``
+            # סוגרת את הדלת קדימה; זה מגן על מה שכבר בפנים.
+            return {name: stored.get(name) is True for name in NOTE_FONT_SURFACES}, scope
+
+    return _note_fonts_default(), scope
+
+
+def _note_fonts_etag_key(
+    user_id: Optional[int],
+    *,
+    user_doc: Optional[Dict[str, Any]] = None,
+) -> str:
+    """מפתח קצר שמייצג את גופן הפתקים הנוכחי, ל-ETag ולמפתח הקאש.
+
+    **למה זה נחוץ:** ``_note_fonts_head.html`` מרנדר את ההעדפה **לתוך
+    ה-HTML**. בלי שהיא תיכנס לוולידטור, שינוי ההגדרה אינו משנה את ה-ETag,
+    השרת מחזיר 304, והדפדפן מציג את העמוד הישן עם הדגל הישן — בלי קשר
+    לשאלה אם קאש ה-Redis דלוק, כי מסלול ה-304 אינו נוגע בו.
+
+    ``theme`` כבר נמצא ב-ETag ובמפתח הקאש מאותה סיבה בדיוק; זה אותו כלל
+    שמוחל על הערך השני שמרונדר פר-משתמש.
+    """
+    try:
+        fonts, _ = _resolve_note_fonts(user_id, user_doc)
+        return "nf:" + _encode_note_fonts(fonts)
+    except Exception:
+        return "nf:" + _encode_note_fonts(None)
 
 
 def _parse_theme_token(raw: Optional[str]) -> tuple[str, str, str]:
@@ -2524,13 +2691,51 @@ def _safe_dt_from_doc(value) -> datetime:
     return dt
 
 
-def _get_theme_etag_key(user_id: Optional[int]) -> str:
-    """מפתח קצר שמייצג את ערכת הנושא הנוכחית (כולל שינויי גרסה)."""
+#: הפרויקציה שהילפרי ה-ETag צריכים. מוגדרת פעם אחת כדי שקורא שרוצה
+#: לשלוף את המסמך **בעצמו** ולחסוך שאילתה יוכל לבקש בדיוק את מה שהם
+#: קוראים — בלי לנחש ובלי שהרשימות ייסחפו זו מזו.
+ETAG_USER_PROJECTION = {
+    'ui_prefs.theme': 1,
+    'ui_prefs.note_fonts': 1,
+    'custom_themes': 1,
+    'custom_theme': 1,
+}
+
+
+def _etag_needs_user_doc() -> bool:
+    """האם מישהו מהוולידטורים באמת יזדקק למסמך המשתמש בבקשה הזו.
+
+    שני ההילפרים נופלים ל-DB רק כשה-cookie אינו מכריע: ערכה במצב
+    ``device`` עם ערך תקף, וגופן במצב ``device`` עם ערך שנפרס בהצלחה.
+    כששניהם מוכרעים מה-cookie — אין למסד מה לתרום, והשליפה המשותפת
+    היא עלות מיותרת על המסלול החם ביותר.
+    """
+    theme_decided = (
+        _normalize_theme_scope(request.cookies.get('ui_theme_scope')) == THEME_SCOPE_DEVICE
+        and bool((request.cookies.get('ui_theme') or '').strip())
+    )
+    fonts_decided = (
+        _normalize_theme_scope(request.cookies.get('ui_note_fonts_scope')) == THEME_SCOPE_DEVICE
+        and _decode_note_fonts(request.cookies.get('ui_note_fonts')) is not None
+    )
+    return not (theme_decided and fonts_decided)
+
+
+def _get_theme_etag_key(
+    user_id: Optional[int],
+    *,
+    user_doc: Optional[Dict[str, Any]] = None,
+) -> str:
+    """מפתח קצר שמייצג את ערכת הנושא הנוכחית (כולל שינויי גרסה).
+
+    ``user_doc`` חוסך שליפה כשהקורא כבר החזיק את המסמך. חייב להיות
+    מסמך שנשלף עם ``ETAG_USER_PROJECTION`` (או רחב ממנה).
+    """
     theme_raw = get_default_ui_theme_raw()
-    user_doc = None
     try:
         theme_raw, _, _, user_doc = _resolve_theme_raw_token(
             user_id,
+            user_doc=user_doc,
             projection={'ui_prefs.theme': 1, 'custom_themes': 1, 'custom_theme': 1},
         )
     except Exception:
@@ -2643,6 +2848,9 @@ def _compute_file_etag(doc: Dict[str, Any], *, variant: str = '') -> str:
             'n': file_name,
             'v': version,
             'sha': hashlib.sha256(raw_code.encode('utf-8')).hexdigest(),
+            # גרסת ה-deploy: בלעדיה קובץ שלא נערך מחזיר ETag זהה בין deploys,
+            # והדפדפן מקבל 304 ומציג תבנית ישנה (בלי אלמנטים חדשים).
+            'sv': _STATIC_VERSION,
         }
         if variant:
             payload_data['var'] = variant
@@ -4074,22 +4282,13 @@ def premium_or_admin_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-def is_admin(user_id: int) -> bool:
-    """בודק אם משתמש הוא אדמין"""
-    admin_ids_env = os.getenv('ADMIN_USER_IDS', '')
-    admin_ids_list = admin_ids_env.split(',') if admin_ids_env else []
-    admin_ids = [int(x.strip()) for x in admin_ids_list if x.strip().isdigit()]
-    return user_id in admin_ids
-
-def is_premium(user_id: int) -> bool:
-    """בודק אם משתמש הוא פרימיום לפי ENV PREMIUM_USER_IDS"""
-    try:
-        premium_ids_env = os.getenv('PREMIUM_USER_IDS', '')
-        premium_ids_list = premium_ids_env.split(',') if premium_ids_env else []
-        premium_ids = [int(x.strip()) for x in premium_ids_list if x.strip().isdigit()]
-        return user_id in premium_ids
-    except Exception:
-        return False
+# ``is_admin``/``is_premium`` חיים ב-``user_roles`` — מודול טהור בשורש. הם
+# מיוצאים כאן בשמם כדי שכל מי שכבר עושה ``from webapp.app import is_admin``
+# (themes_api, routes/repo_browser, routes/auth_routes) ימשיך לעבוד.
+# הסיבה להוצאה: הלוגיקה הייתה משוכפלת מילה במילה גם ב-``code_tools_api``,
+# ובנוסף ``sticky_notes_api`` זקוק לה — ו-``app`` מייבא אותו, כך שייבוא הפוך
+# היה יוצר מעגל.
+from user_roles import is_admin, is_premium  # noqa: E402,F401
 
 
 # --- Admin Impersonation Functions ---
@@ -5596,7 +5795,7 @@ def admin_stats_page():
             weekly_users=displayed_users,
             weekly_limit=weekly_limit,
             total_actions=total_actions,
-            generated_at=datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M'),
+            generated_at=format_datetime_display(datetime.now(timezone.utc)),
         )
     except Exception:
         logger.exception("Error in admin stats page")
@@ -5607,7 +5806,7 @@ def admin_stats_page():
             weekly_limit=0,
             total_actions=0,
             error="אירעה שגיאה בטעינת הנתונים. נסה שוב מאוחר יותר.",
-            generated_at=datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M'),
+            generated_at=format_datetime_display(datetime.now(timezone.utc)),
         ), 500
 
 
@@ -5655,12 +5854,15 @@ def admin_config_inspector_page():
     )
     category_summary = service.get_category_summary()
     missing_required = service.validate_required()
+    # עמוד 2: משתני שירותים אחרים (bot/mcp/scripts) — מטא-דאטה בלבד, בלי Status/Active Value
+    other_services = service.get_other_services_entries()
 
     return render_template(
         "admin_config_inspector.html",
         overview=overview,
         category_summary=category_summary,
         missing_required=missing_required,
+        other_services=other_services,
         selected_category=category,
         selected_status=status,
         statuses=[s.value for s in ConfigStatus],
@@ -7322,7 +7524,9 @@ def admin_snippets_export_json():
     include_pending = request.args.get('include_pending') == '1'
     payload = _build_snippet_export_payload(coll, include_pending=include_pending)
     body = json.dumps(payload, ensure_ascii=False, indent=2)
-    file_name = f"snippets-export-{datetime.now(timezone.utc).strftime('%Y%m%d')}.json"
+    # התאריך בשם הקובץ הוא תווית לקריאת אדם, ולכן בשעון ישראל כמו כל תצוגה
+    export_day = TimeUtils.to_israel_time(datetime.now(timezone.utc)).strftime('%Y%m%d')
+    file_name = f"snippets-export-{export_day}.json"
     response = Response(body, mimetype='application/json; charset=utf-8')
     response.headers['Content-Disposition'] = f'attachment; filename="{file_name}"'
     return response
@@ -9781,40 +9985,203 @@ def is_binary_file(content: str | bytes, filename: str = "") -> bool:
     
     return False
 
+
+# אמוג'י לכל שפה — משמש כ-fallback לשפות שאין להן עדיין אייקון מצויר
+LANG_EMOJI_ICONS = {
+    'python': '🐍',
+    'javascript': '📜',
+    'typescript': '📘',
+    'java': '☕',
+    'cpp': '⚙️',
+    'c': '🔧',
+    'csharp': '🎯',
+    'go': '🐹',
+    'rust': '🦀',
+    'ruby': '💎',
+    'php': '🐘',
+    'swift': '🦉',
+    'kotlin': '🎨',
+    'html': '🌐',
+    'css': '🎨',
+    'sql': '🗄️',
+    'bash': '🖥️',
+    'shell': '🐚',
+    'dockerfile': '🐳',
+    'yaml': '📋',
+    'json': '📊',
+    'xml': '📄',
+    'markdown': '📝',
+    'env': '🔐',
+    'dotenv': '🔐',
+    'gitignore': '🚫',
+    'dockerignore': '🚫',
+    'makefile': '🔨',
+    'nginx': '🔀',
+    'text': '📄',
+    # לא שפה, אבל מוצג באותה שורה: קובץ שלא ניתן להציג את תוכנו
+    'binary': '🔒',
+}
+
+
 def get_language_icon(language: Optional[str]) -> str:
     """מחזיר אייקון עבור שפת תכנות/קטגוריה"""
-    icons = {
-        'python': '🐍',
-        'javascript': '📜',
-        'typescript': '📘',
-        'java': '☕',
-        'cpp': '⚙️',
-        'c': '🔧',
-        'csharp': '🎯',
-        'go': '🐹',
-        'rust': '🦀',
-        'ruby': '💎',
-        'php': '🐘',
-        'swift': '🦉',
-        'kotlin': '🎨',
-        'html': '🌐',
-        'css': '🎨',
-        'sql': '🗄️',
-        'bash': '🖥️',
-        'shell': '🐚',
-        'dockerfile': '🐳',
-        'yaml': '📋',
-        'json': '📊',
-        'xml': '📄',
-        'markdown': '📝',
-        'env': '🔐',
-        'dotenv': '🔐',
-        'gitignore': '🚫',
-        'dockerignore': '🚫',
-        'text': '📄',
-    }
     normalized = (language or '').strip().lower()
-    return icons.get(normalized, '📄')
+    return LANG_EMOJI_ICONS.get(normalized, '📄')
+
+
+# ============================================================
+# אייקוני שפה מצוירים (SVG)
+# ============================================================
+# מקור האמת היחיד לאייקוני שפה בכל ה-Webapp. הספרייט עצמו יושב ב-
+# templates/components/lang_sprite.html ומוזרק פעם אחת ב-base.html.
+# בצד ה-JS יש מקבילה מדויקת — window.langIcon() ב-base.html.
+# שפה שאין לה אייקון מצויר נופלת חזרה לאמוג'י של get_language_icon.
+
+# השפות שיש להן <symbol id="lang-..."> בספרייט.
+# הספרייט נבנה על ידי scripts/build_lang_sprite.py, ו-tests/test_lang_icons.py
+# מוודא שהרשימה כאן והספרייט תמיד תואמים.
+LANG_ICON_SLUGS = frozenset({
+    'bash', 'c', 'cpp', 'csharp', 'css', 'dockerfile', 'dockerignore', 'env',
+    'gitignore', 'go', 'html', 'java', 'javascript', 'json', 'kotlin',
+    'makefile', 'markdown', 'nginx', 'php', 'python', 'ruby', 'rust', 'sql',
+    'swift', 'text', 'typescript', 'xml', 'yaml',
+})
+
+# האייקון שמקבל כל קובץ שהשפה שלו לא מזוהה
+LANG_ICON_FALLBACK_SLUG = 'text'
+
+# הגדלים שבהם מוצג אייקון שפה, לפי סוג המקום שבו הוא יושב.
+# מרוכזים כאן ולא מפוזרים בין התבניות ל-JS, כי כוונון ויזואלי נעשה
+# תמיד על כל המקומות יחד — וכשהמספרים ישבו בנפרד, אותו מסך קיבל
+# בטעות שני גדלים שונים בשני מסלולי רינדור.
+LANG_ICON_SIZES = {
+    'file_row': 44,   # דף הקבצים, כרטיסים נעוצים, עמוד הקובץ
+    'list': 32,       # דשבורד, קבצים משותפים, סל מיחזור, מודאלים
+    'timeline': 28,   # אירועי קבצים בטיימליין הפעילות
+    'search': 28,     # תוצאות החיפוש הגלובלי
+    'compact': 22,    # ספריית הסניפטים
+}
+
+# שמות נרדפים שחולקים אייקון עם שפה אחרת — חוסך ציור אייקון כפול
+LANG_ICON_ALIASES = {
+    'sh': 'bash',
+    'shell': 'bash',
+    'zsh': 'bash',
+    'dotenv': 'env',
+    'yml': 'yaml',
+    'py': 'python',
+    'js': 'javascript',
+    'jsx': 'javascript',
+    'ts': 'typescript',
+    'tsx': 'typescript',
+    'rb': 'ruby',
+    'rs': 'rust',
+    'c++': 'cpp',
+    'c#': 'csharp',
+    'cs': 'csharp',
+    'kt': 'kotlin',
+    'kts': 'kotlin',
+    'golang': 'go',
+    'node': 'javascript',
+    'nodejs': 'javascript',
+    'html5': 'html',
+    'css3': 'css',
+    'md': 'markdown',
+    'docker': 'dockerfile',
+    # שפות סגנון שנשענות על אייקון ה-CSS
+    'scss': 'css',
+    'sass': 'css',
+    'less': 'css',
+    'txt': 'text',
+    'plaintext': 'text',
+}
+
+
+def get_language_slug(language: Optional[str]) -> str:
+    """מחזיר את מזהה האייקון המצויר לשפה, או מחרוזת ריקה אם אין לה אייקון"""
+    normalized = (language or '').strip().lower()
+    normalized = LANG_ICON_ALIASES.get(normalized, normalized)
+    return normalized if normalized in LANG_ICON_SLUGS else ''
+
+
+def lang_icon(
+    language: Optional[str],
+    size: int = 32,
+    css_class: str = '',
+    decorative: bool = True,
+) -> Markup:
+    """מחזיר את האייקון של השפה, מוכן להטמעה בתבנית.
+
+    סדר העדיפויות:
+    1. יש אייקון מצויר לשפה — מחזירים אותו.
+    2. אין אייקון אבל יש לשפה אמוג'י ייחודי במפה (למשל 🔒 לקובץ בינארי) —
+       שומרים על הסמל הזה במקום לאבד מידע.
+    3. שפה שלא מוכרת בכלל — אייקון ה-text, כדי שלא תתקבל תערובת של
+       אמוג'י ואייקונים באותה רשימה.
+
+    בניגוד לאמוג'י, ל-SVG אין ירושה של גודל מ-font-size ולכן הגודל נמסר
+    במפורש בפיקסלים.
+
+    decorative: ברירת המחדל היא אייקון מוסתר מקוראי מסך, כי בכל מקום
+    שבו הוא מוצג היום מופיע לצדו גם שם הקובץ עם הסיומת או תגית השפה,
+    כך שהקראה נוספת רק מכפילה את המידע. העבירו False רק אם האייקון
+    הוא הסימן היחיד לשפה.
+    """
+    try:
+        px = max(8, min(256, int(size)))
+    except (TypeError, ValueError):
+        px = 32
+
+    extra = f' {css_class}' if css_class else ''
+    normalized = (language or '').strip().lower()
+    slug = get_language_slug(language)
+
+    if not slug and normalized not in LANG_EMOJI_ICONS:
+        slug = get_language_slug(LANG_ICON_FALLBACK_SLUG)
+
+    # התבניות למטה הן מחרוזות קבועות, וכל הערכים מוזרקים דרך Markup.format
+    # שמבריח אותם אוטומטית. זו הסיבה שאין כאן escape ידני — ושאין דרך
+    # להזריק HTML דרך שם מחלקה או שם שפה.
+    if not slug:
+        # לשפה יש סמל ייחודי משלה אף שאין לה אייקון מצויר
+        return Markup(
+            '<span class="lang-icon lang-icon--emoji{extra}" '
+            'style="font-size:{px}px;line-height:1" aria-hidden="true">'
+            '{emoji}</span>'
+        ).format(extra=extra, px=px, emoji=LANG_EMOJI_ICONS.get(normalized, '📄'))
+
+    if decorative:
+        label = Markup('aria-hidden="true"')
+    else:
+        label = Markup('role="img" aria-label="{slug}"').format(slug=slug)
+
+    return Markup(
+        '<svg class="lang-icon{extra}" width="{px}" height="{px}" '
+        'viewBox="0 0 64 64" {label}>'
+        '<use href="#lang-{slug}"></use></svg>'
+    ).format(extra=extra, px=px, label=label, slug=slug)
+
+
+def lang_icon_data() -> Dict[str, Any]:
+    """הנתונים שצד הלקוח צריך כדי לבנות את אותם אייקונים בדיוק.
+
+    מוזרק פעם אחת ב-base.html כדי שלא תהיה מפת שפות משוכפלת בקוד ה-JS —
+    כל שינוי כאן משפיע על השרת ועל הדפדפן יחד.
+    """
+    return {
+        'slugs': sorted(LANG_ICON_SLUGS),
+        'aliases': LANG_ICON_ALIASES,
+        'emoji': LANG_EMOJI_ICONS,
+        'fallback': LANG_ICON_FALLBACK_SLUG,
+        'sizes': LANG_ICON_SIZES,
+    }
+
+
+# זמין בכל תבנית בלי import — {{ lang_icon(file.language, 32) }}
+app.jinja_env.globals['lang_icon'] = lang_icon
+app.jinja_env.globals['lang_slug'] = get_language_slug
+app.jinja_env.globals['lang_icon_data'] = lang_icon_data
+app.jinja_env.globals['LANG_ICON_SIZES'] = LANG_ICON_SIZES
 
 
 def resolve_file_language(language: Optional[str], file_name: str = "") -> str:
@@ -9850,20 +10217,27 @@ def safe_iso(value, field: str = "") -> str:
         except Exception:
             return ""
 
+def _to_display_datetime(value) -> Optional[datetime]:
+    """ממיר ערך תאריך (datetime או מחרוזת ISO) לשעון ישראל, או None אם אין.
+
+    כל תצוגת תאריך בוובאפ עוברת דרך כאן, כדי שלא ייווצר מצב שבו מסך אחד
+    מראה שעון ישראל ומסך אחר מראה UTC עבור אותו קובץ.
+    """
+    if isinstance(value, datetime):
+        return TimeUtils.to_israel_time(value)
+    if isinstance(value, str) and value:
+        try:
+            return TimeUtils.to_israel_time(datetime.fromisoformat(value))
+        except Exception:
+            return None
+    return None
+
+
 # עיצוב תאריך בטוח לתצוגה ללא נפילה לברירת מחדל של עכשיו
 def format_datetime_display(value) -> str:
     try:
-        if isinstance(value, datetime):
-            dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-            return dt.strftime('%d/%m/%Y %H:%M')
-        if isinstance(value, str) and value:
-            try:
-                dtp = datetime.fromisoformat(value)
-                dtp = dtp if dtp.tzinfo is not None else dtp.replace(tzinfo=timezone.utc)
-                return dtp.strftime('%d/%m/%Y %H:%M')
-            except Exception:
-                return ''
-        return ''
+        dt = _to_display_datetime(value)
+        return dt.strftime('%d/%m/%Y %H:%M') if dt else ''
     except Exception:
         return ''
 
@@ -9871,17 +10245,8 @@ def format_datetime_display(value) -> str:
 @app.template_filter('hhmm')
 def format_time_hhmm(value) -> str:
     try:
-        if isinstance(value, datetime):
-            dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-            return dt.strftime('%H:%M')
-        if isinstance(value, str) and value:
-            try:
-                dtp = datetime.fromisoformat(value)
-                dtp = dtp if dtp.tzinfo is not None else dtp.replace(tzinfo=timezone.utc)
-                return dtp.strftime('%H:%M')
-            except Exception:
-                return ''
-        return ''
+        dt = _to_display_datetime(value)
+        return dt.strftime('%H:%M') if dt else ''
     except Exception:
         return ''
 
@@ -9899,18 +10264,12 @@ def jinja_format_datetime(value) -> str:
 @app.template_filter('day_hhmm')
 def format_day_hhmm(value) -> str:
     try:
-        if isinstance(value, datetime):
-            dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-        elif isinstance(value, str) and value:
-            try:
-                dt = datetime.fromisoformat(value)
-                dt = dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-            except Exception:
-                return ''
-        else:
+        dt = _to_display_datetime(value)
+        if not dt:
             return ''
-
-        now = datetime.now(timezone.utc)
+        # "היום" נמדד גם הוא בשעון ישראל. בהשוואה מול UTC, כל מה שקרה
+        # אחרי חצות בישראל היה נראה כאילו קרה אתמול.
+        now = TimeUtils.to_israel_time(datetime.now(timezone.utc))
         if dt.date() == now.date():
             return dt.strftime('%H:%M')
         return dt.strftime('%d/%m %H:%M')
@@ -10161,7 +10520,7 @@ def _format_relative(dt: Optional[datetime]) -> str:
         return TimeUtils.format_relative_time(dt)
     except Exception:
         try:
-            return dt.strftime('%d/%m/%Y %H:%M')
+            return format_datetime_display(dt)
         except Exception:
             return "לא ידוע"
 
@@ -10170,7 +10529,7 @@ def _format_calendar_hint(dt: Optional[datetime]) -> str:
     if not isinstance(dt, datetime):
         return ""
     try:
-        localized = dt.astimezone(timezone.utc)
+        localized = TimeUtils.to_israel_time(dt)
     except Exception:
         localized = dt
     return localized.strftime('%d/%m %H:%M')
@@ -10271,7 +10630,11 @@ def _build_timeline_event(
     title: str,
     subtitle: str,
     dt: Any,
-    icon: str,
+    # אמוג'י כמחרוזת, או Markup של אייקון מצויר עבור אירועי קבצים
+    icon: Union[str, Markup],
+    # שפת הקובץ, לאירועי קבצים בלבד. צד הלקוח בונה ממנה את האייקון
+    # בעצמו כשהוא מוסיף שורות ב"טען עוד", ולכן אין צורך ב-HTML ב-JSON.
+    icon_lang: Optional[str] = None,
     badge: Optional[str] = None,
     badge_variant: Optional[str] = None,
     href: Optional[str] = None,
@@ -10283,6 +10646,7 @@ def _build_timeline_event(
         '_dt': normalized_dt,
         'group': group,
         'icon': icon,
+        'icon_lang': icon_lang,
         'title': title,
         'subtitle': subtitle or '',
         'badge': badge,
@@ -10354,7 +10718,10 @@ def _build_activity_timeline(db, user_id: int, active_query: Optional[Dict[str, 
                 title=title,
                 subtitle=subtitle,
                 dt=dt,
-                icon=get_language_icon(language),
+                # אירוע קובץ בטיימליין מציג את שפת הקובץ, ולכן אייקון
+                # מצויר ולא אמוג'י. שאר סוגי האירועים ממשיכים עם אמוג'י.
+                icon=lang_icon(language, LANG_ICON_SIZES['timeline']),
+                icon_lang=language,
                 badge=file_badge,
                 badge_variant='code',
                 href=href,
@@ -11037,7 +11404,7 @@ def _legacy_dashboard():
             file['language'] = language
             file['icon'] = get_language_icon(language)
             if 'created_at' in file:
-                file['created_at_formatted'] = file['created_at'].strftime('%d/%m/%Y %H:%M')
+                file['created_at_formatted'] = format_datetime_display(file['created_at'])
         
         stats = {
             'total_files': total_files,
@@ -11099,10 +11466,7 @@ def _legacy_dashboard():
                             local_dt = None
                             try:
                                 normalized = raw_date.replace("Z", "+00:00")
-                                parsed = datetime.fromisoformat(normalized)
-                                if parsed.tzinfo is None:
-                                    parsed = parsed.replace(tzinfo=timezone.utc)
-                                local_dt = parsed.astimezone(ZoneInfo("Asia/Jerusalem"))
+                                local_dt = TimeUtils.to_israel_time(datetime.fromisoformat(normalized))
                             except Exception:
                                 local_dt = None
                             if local_dt is not None:
@@ -12233,7 +12597,8 @@ def view_file(file_id):
         resp.headers['Last-Modified'] = last_modified_str
         return resp
     ims = request.headers.get('If-Modified-Since')
-    if ims:
+    # RFC 7232 §3.3: אם קיים If-None-Match, מתעלמים מ-If-Modified-Since (אחרת 304 מיושן)
+    if ims and not inm:
         try:
             ims_dt = parse_date(ims)
         except Exception:
@@ -14559,6 +14924,142 @@ def raw_html(file_id):
     resp.headers['Cache-Control'] = 'no-store'
     return resp
 
+
+# --- תצוגת SVG ---------------------------------------------------------------
+# סיומות שנחשבות קובץ SVG לצורך כפתור התצוגה 🌐
+_SVG_FILE_EXTENSIONS = ('.svg',)
+# תגית ה-<svg> הפותחת, לזיהוי ולהשלמת xmlns חסר
+_SVG_OPEN_TAG_RE = re.compile(r'<svg\b[^>]*>', re.IGNORECASE)
+_SVG_XMLNS_RE = re.compile(r'\bxmlns\s*=', re.IGNORECASE)
+# ספרייט אייקונים – קובץ שכולו <symbol> לא מצייר כלום עד שמפנים אליו ב-<use>
+_SVG_SYMBOL_RE = re.compile(r'<symbol\b', re.IGNORECASE)
+# בלוקים שלא מציירים בעצמם, אלא רק מגדירים תוכן לשימוש חוזר
+_SVG_HIDDEN_BLOCK_RE = re.compile(r'<(defs|symbol)\b[^>]*>.*?</\1\s*>', re.IGNORECASE | re.DOTALL)
+# הרכיבים ש-SVG באמת מצייר איתם
+_SVG_DRAWABLE_RE = re.compile(
+    r'<(path|circle|ellipse|rect|line|polyline|polygon|text|image|use|foreignObject)\b',
+    re.IGNORECASE,
+)
+
+
+def _is_svg_file(file_name: Optional[str]) -> bool:
+    """האם הקובץ הוא SVG, לפי הסיומת בלבד.
+
+    זיהוי השפה האוטומטי מסמן קבצי SVG כ-xml (כי מבחינת תוכן זה באמת XML),
+    ולכן אי אפשר להסתמך עליו כדי להבדיל בין SVG לבין XML רגיל.
+    """
+    if not isinstance(file_name, str):
+        return False
+    return file_name.strip().lower().endswith(_SVG_FILE_EXTENSIONS)
+
+
+def _ensure_svg_xmlns(code: str) -> str:
+    """משלים xmlns חסר בתגית ה-<svg> הפותחת.
+
+    SVG שנטען כתמונה נפרס כ-XML, ובלי ה-namespace הדפדפן מסרב לצייר אותו.
+    זה קורה הרבה כשמעתיקים SVG מתוך JSX או מתוך דף HTML, שם ה-namespace
+    מיותר ולכן נשמט. משלימים אותו כאן כדי שהתצוגה לא תישבר בגלל פרט טכני.
+    """
+    text = code or ''
+    match = _SVG_OPEN_TAG_RE.search(text)
+    if not match:
+        return text
+    open_tag = match.group(0)
+    if _SVG_XMLNS_RE.search(open_tag):
+        return text
+    # הזרקה מיד אחרי "<svg" – ארבעת התווים הראשונים של התגית
+    patched = open_tag[:4] + ' xmlns="http://www.w3.org/2000/svg"' + open_tag[4:]
+    return text[:match.start()] + patched + text[match.end():]
+
+
+def _is_svg_sprite(code: str) -> bool:
+    """האם ה-SVG הוא ספרייט – כלומר לא יצייר כלום בתצוגה רגילה.
+
+    לא מספיק לחפש <symbol>: קובץ רגיל יכול להחזיק symbol בתוך <defs> ובכל
+    זאת לצייר משהו בעצמו. לכן מסירים קודם את הבלוקים שלא מציירים, ורק אם
+    לא נשאר אף רכיב מצויר מדובר בספרייט.
+    """
+    text = code or ''
+    if not _SVG_SYMBOL_RE.search(text):
+        return False
+    visible = _SVG_HIDDEN_BLOCK_RE.sub('', text)
+    return not _SVG_DRAWABLE_RE.search(visible)
+
+
+@app.route('/svg/<file_id>')
+@login_required
+def svg_preview(file_id):
+    """תצוגה מרונדרת של קובץ SVG, עם אפשרות להחליף רקע."""
+    db = get_db()
+    user_id = session['user_id']
+    try:
+        file, _kind = _get_user_any_file_by_id(db, user_id, file_id)
+    except Exception:
+        abort(404)
+    if not file:
+        abort(404)
+
+    # מציגים תצוגת SVG רק לקבצי SVG. בלי ברירת מחדל לשם – קובץ בלי שם לא
+    # יעבור את הבדיקה ב-/raw_svg, והתוצאה תהיה עמוד עם תמונה שבורה.
+    file_name = file.get('file_name')
+    if not _is_svg_file(file_name):
+        return redirect(url_for('view_file', file_id=file_id))
+
+    code = str(file.get('code') or file.get('content') or '')
+    file_data = {
+        'id': str(file.get('_id')),
+        'file_name': file_name,
+        'language': (file.get('programming_language') or 'xml').lower(),
+        # ספרייט נראה כמו תצוגה ריקה, ולכן מתריעים עליו מראש
+        'is_sprite': _is_svg_sprite(code),
+    }
+    return render_template('svg_preview.html', user=session.get('user_data', {}), file=file_data, bot_username=BOT_USERNAME_CLEAN)
+
+
+@app.route('/raw_svg/<file_id>')
+@login_required
+def raw_svg(file_id):
+    """מחזיר את ה-SVG הגולמי לטעינה בתוך <img> בעמוד התצוגה.
+
+    התגובה מוגשת כ-image/svg+xml: בהקשר של <img> הדפדפן מרנדר SVG במצב
+    סטטי מאובטח – בלי סקריפטים, בלי משאבים חיצוניים ובלי אינטראקטיביות.
+    כותרת ה-CSP מוסיפה שכבה שנייה, ומגנה גם כשפותחים את הכתובת ישירות.
+    """
+    db = get_db()
+    user_id = session['user_id']
+    try:
+        file, _kind = _get_user_any_file_by_id(db, user_id, file_id)
+    except Exception:
+        abort(404)
+    if not file:
+        abort(404)
+
+    if not _is_svg_file(file.get('file_name')):
+        abort(404)
+
+    code = _ensure_svg_xmlns(str(file.get('code') or file.get('content') or ''))
+    csp = \
+        "sandbox; " \
+        "default-src 'none'; " \
+        "base-uri 'none'; " \
+        "form-action 'none'; " \
+        "connect-src 'none'; " \
+        "img-src data:; " \
+        "style-src 'unsafe-inline'; " \
+        "font-src data:; " \
+        "object-src 'none'; " \
+        "frame-ancestors 'self'; " \
+        "script-src 'none'"
+
+    resp = Response(code, content_type='image/svg+xml; charset=utf-8')
+    resp.headers['Content-Security-Policy'] = csp
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    resp.headers['Referrer-Policy'] = 'no-referrer'
+    resp.headers['Cache-Control'] = 'no-store'
+    resp.headers['Content-Disposition'] = 'inline'
+    return resp
+
+
 @app.route('/md/<file_id>')
 @login_required
 def md_preview(file_id):
@@ -14592,8 +15093,29 @@ def md_preview(file_id):
         force_no_cache = False
 
     # --- HTTP cache validators (ETag / Last-Modified) ---
-    theme_key = _get_theme_etag_key(user_id)
-    etag = _compute_file_etag(file, variant=theme_key)
+    # **שליפה אחת לשני הוולידטורים.** ``/md/<id>`` הוא מסלול חם, וכל
+    # בקשה עוברת כאן — כולל בקשות ולידציה שיסתיימו ב-304. שני ההילפרים
+    # קוראים את אותו מסמך משתמש, ולכן הוא נשלף פעם אחת ומועבר לשניהם
+    # במקום ששניהם יפנו למסד בנפרד.
+    #
+    # **ולא שולפים כשאיש לא צריך:** ``_resolve_theme_raw_token`` מדלג על
+    # המסד כשה-cookie של הערכה תקף ובמצב ``device``, ו-``_resolve_note_fonts``
+    # מדלג באותם תנאים. כששני ה-scopes הם ``device`` עם cookies תקינים —
+    # אפס שאילתות, כפי שהיה לפני ההוספה.
+    _etag_user_doc = None
+    if user_id and _etag_needs_user_doc():
+        try:
+            _etag_user_doc = get_db().users.find_one(
+                {'user_id': int(user_id)}, ETAG_USER_PROJECTION
+            ) or {}
+        except Exception:
+            _etag_user_doc = None
+
+    theme_key = _get_theme_etag_key(user_id, user_doc=_etag_user_doc)
+    # ``note_fonts`` בוולידטור: העמוד הזה מרנדר את ההעדפה לתוך ה-HTML,
+    # ובלי זה שינוי ההגדרה מחזיר את אותו ETag ← 304 ← הדגל הישן.
+    note_fonts_key = _note_fonts_etag_key(user_id, user_doc=_etag_user_doc)
+    etag = _compute_file_etag(file, variant=f"{theme_key}|{note_fonts_key}")
     last_modified_dt = _safe_dt_from_doc(file.get('updated_at') or file.get('created_at'))
     last_modified_str = http_date(last_modified_dt)
     inm = request.headers.get('If-None-Match')
@@ -14602,17 +15124,23 @@ def md_preview(file_id):
         resp.headers['ETag'] = etag
         resp.headers['Last-Modified'] = last_modified_str
         return resp
-    ims = request.headers.get('If-Modified-Since')
-    if ims:
-        try:
-            ims_dt = parse_date(ims)
-        except Exception:
-            ims_dt = None
-        if not force_no_cache and ims_dt is not None and last_modified_dt.replace(microsecond=0) <= ims_dt:
-            resp = Response(status=304)
-            resp.headers['ETag'] = etag
-            resp.headers['Last-Modified'] = last_modified_str
-            return resp
+    # **``If-Modified-Since`` אינו מכריע כאן, לפי התקן עצמו.**
+    #
+    # RFC 9110 §13.1.3: *"A recipient MUST ignore the If-Modified-Since
+    # header field if the resource does not have a modification date
+    # available."* — ולייצוג הזה אין כזה. ``last_modified_dt`` הוא תאריך
+    # **הקובץ**, בעוד שה-HTML תלוי גם בערכת הנושא וגם בגופן הפתקים, שהם
+    # פר-משתמש ופר-מכשיר ואין להם תאריך שינוי. לקוח ששלח ``IMS`` בלבד
+    # אחרי שינוי גופן היה מקבל 304 עם הדגל הישן.
+    #
+    # אותה סעיף גם מגדיר את התכלית של ``IMS``: *"to allow efficient
+    # updates of a cached representation **that does not have an entity
+    # tag**"* — ולעמוד הזה **יש** ETag, שכן מקודד את ההעדפות. הוולידטור
+    # החזק כבר עושה את העבודה, והחלש רק יכול לטעות.
+    #
+    # ``Last-Modified`` ממשיך להישלח כמטא-דאטה; ה-``after_request`` שם
+    # ``private, max-age=0, must-revalidate``, ולכן קאש משותף אינו
+    # רשאי להשתמש בו כהיוריסטיקה.
 
     # --- Cache: תוצר ה-HTML של תצוגת Markdown (תבנית) ---
     should_cache = getattr(cache, 'is_enabled', False)
@@ -14624,6 +15152,12 @@ def md_preview(file_id):
                 'file_name': file_name,
                 'lang': 'markdown',
                 'theme': theme_key,
+                # אותה החלטה כמו ב-ETag שלמעלה. הבלוק הזה רץ רק כשקאש
+                # ה-Redis דלוק; ה-ETag רץ תמיד. שניהם מקודדים את אותו
+                # ערך, כדי שלא ייווצר פער בין שני הוולידטורים.
+                'nf': note_fonts_key,
+                # גרסת deploy במפתח: אחרת ה-HTML המרונדר הישן מוגש עד פקיעת ה-TTL (30 דק')
+                'sv': _STATIC_VERSION,
             }
             _raw = json.dumps(_params, sort_keys=True, ensure_ascii=False)
             _hash = hashlib.sha256(_raw.encode('utf-8')).hexdigest()[:24]
@@ -14745,7 +15279,8 @@ def reader_mode(filename):
         resp.headers['Last-Modified'] = last_modified_str
         return resp
     ims = request.headers.get('If-Modified-Since')
-    if ims:
+    # RFC 7232 §3.3: אם קיים If-None-Match, מתעלמים מ-If-Modified-Since (אחרת 304 מיושן)
+    if ims and not inm:
         try:
             ims_dt = parse_date(ims)
         except Exception:
@@ -16762,7 +17297,10 @@ def _legacy_api_dashboard_activity_files():
                 title=title,
                 subtitle=subtitle,
                 dt=dt,
-                icon=get_language_icon(language),
+                # אירוע קובץ בטיימליין מציג את שפת הקובץ, ולכן אייקון
+                # מצויר ולא אמוג'י. שאר סוגי האירועים ממשיכים עם אמוג'י.
+                icon=lang_icon(language, LANG_ICON_SIZES['timeline']),
+                icon_lang=language,
                 badge=file_badge,
                 badge_variant='code',
                 href=href,
@@ -17322,6 +17860,9 @@ def api_ui_prefs():
         theme_cookie_value: Optional[str] = None
         theme_scope_cookie_value: Optional[str] = None
         theme_scope: Optional[str] = None
+        note_fonts_cookie_value: Optional[str] = None
+        note_fonts_scope_cookie_value: Optional[str] = None
+        note_fonts_scope: Optional[str] = None
 
         # עדכון גודל גופן במידת הצורך
         if 'font_scale' in payload:
@@ -17364,6 +17905,86 @@ def api_ui_prefs():
                 resp_payload['theme'] = theme
                 theme_cookie_value = theme
                 theme_scope_cookie_value = resolved_scope
+
+        # ─── גופן הפתקים ───────────────────────────────────────────────
+        # אותה סמנטיקה בדיוק כמו הערכה: התחולה נקראת **לפני** הערך, כי
+        # היא זו שמכריעה אם הערך נכתב ל-DB או נשאר על המכשיר.
+        if 'note_fonts_scope' in payload:
+            note_fonts_scope = _normalize_theme_scope(payload.get('note_fonts_scope'))
+            note_fonts_scope_cookie_value = note_fonts_scope
+
+        if 'note_fonts' in payload:
+            incoming = payload.get('note_fonts')
+            if not isinstance(incoming, dict):
+                return jsonify({'ok': False, 'error': 'note_fonts must be an object'}), 400
+
+            # **קלט לא תקין נדחה, לא מומר.** ``bool("false")`` הוא ``True``,
+            # ומפתח עם טעות הקלדה היה נבלע ומחזיר 200 בלי שדבר ישתנה —
+            # שתי דרכים שונות לומר למשתמש שנשמר משהו שלא נשמר.
+            for key in incoming:
+                if key not in NOTE_FONT_SURFACES:
+                    return jsonify({
+                        'ok': False,
+                        'error': f'note_fonts: unknown surface {key!r}',
+                    }), 400
+            for key, value in incoming.items():
+                # ``isinstance(value, bool)`` ולא ``int``: ב-Python ``True``
+                # **הוא** ``int``, ולכן בדיקת ``int`` הייתה מקבלת ``1``.
+                if not isinstance(value, bool):
+                    return jsonify({
+                        'ok': False,
+                        'error': f'note_fonts.{key} must be a boolean',
+                    }), 400
+
+            # **כתיבה לכל שדה בנפרד, ולא של תת-המסמך כולו.** לפי תיעוד
+            # MongoDB, ``$set`` על ``ui_prefs.note_fonts`` **מחליף את כל
+            # המסמך המקונן** ומוחק את השדות השכנים — ולכן שתי בקשות חופפות
+            # על שני משטחים שונים היו מבטלות זו את זו. נתיב מנוקד נוגע
+            # בשדה אחד בלבד, ו-``$set`` יוצר את הנתיב אם אינו קיים.
+            resolved_scope = (
+                THEME_SCOPE_DEVICE
+                if note_fonts_scope == THEME_SCOPE_DEVICE
+                else THEME_SCOPE_GLOBAL
+            )
+            try:
+                base_doc = db.users.find_one(
+                    {'user_id': user_id}, {'ui_prefs.note_fonts': 1}
+                ) or {}
+            except Exception:
+                base_doc = {}
+            # ההבחנה בין "השדה חסר" ל"השדה קיים ושווה ``null``" חיונית:
+            # שניהם נראים כמו ``None`` ב-Python, אבל מונגו מתייחס אליהם
+            # הפוך — נתיב חסר נבנה, ו-``null`` נדחה.
+            _prefs = base_doc.get('ui_prefs')
+            _has_key = isinstance(_prefs, dict) and 'note_fonts' in _prefs
+            stored_is_malformed = _has_key and not isinstance(_prefs['note_fonts'], dict)
+            current, _ = _resolve_note_fonts(user_id, base_doc)
+
+            merged = {
+                name: (incoming[name] if name in incoming else current[name])
+                for name in NOTE_FONT_SURFACES
+            }
+
+            if resolved_scope != THEME_SCOPE_DEVICE:
+                # **``$set`` מנוקד דורש שההורה יהיה אובייקט.** נמדד מול
+                # mongod 7.0.14: מחרוזת, מספר, רשימה, ``null`` או בוליאני
+                # במקום ``ui_prefs.note_fonts`` מחזירים ``WriteError`` 28
+                # (``Cannot create field 'md' in element ...``), הראוט
+                # מחזיר 500, והמשתמש נתקע בלי יכולת לשנות גופן לעולם.
+                # שדה חסר לגמרי דווקא **כן** עובד — ``$set`` בונה את הנתיב.
+                #
+                # כשההורה פגום אין שדות שכנים לשמר, ולכן כתיבת האובייקט
+                # השלם היא הסמנטיקה הנכונה — לא ויתור על האטומיות. בכל
+                # מקרה אחר נשארת הכתיבה לכל שדה בנפרד, שהיא זו שמונעת
+                # דריסה בין שתי בקשות חופפות על משטחים שונים.
+                if stored_is_malformed:
+                    update_fields['ui_prefs.note_fonts'] = merged
+                else:
+                    for name, value in incoming.items():
+                        update_fields[f'ui_prefs.note_fonts.{name}'] = value
+            resp_payload['note_fonts'] = merged
+            note_fonts_cookie_value = _encode_note_fonts(merged)
+            note_fonts_scope_cookie_value = resolved_scope
 
         # עדכון סוג העורך במידת הצורך (שיקוף גם ל-session)
         if 'editor' in payload:
@@ -17427,9 +18048,20 @@ def api_ui_prefs():
                 return jsonify({'ok': False, 'error': 'invalid_onboarding'}), 400
 
         needs_db_update = len(update_fields) > 1  # יותר מ-updated_at
+        # **כל ערך cookie חדש חייב להיכנס לרשימה הזו.** היא השומר שמחליט
+        # אם בכלל נבנית תגובה עם קוקיז; ערך שנשכח כאן נכתב, עובר ולידציה,
+        # ואז נזרק בשקט בחזרה המוקדמת שלמטה — התגובה 200 והקוקי לא נשלח.
+        # זה בדיוק מה שקרה ל-``ui_note_fonts`` במצב ``device``, שאינו
+        # כותב ל-DB ולכן ``needs_db_update`` לא כיסה אותו.
         needs_cookie_update = any(
             v is not None
-            for v in (font_scale_cookie_value, theme_cookie_value, theme_scope_cookie_value)
+            for v in (
+                font_scale_cookie_value,
+                theme_cookie_value,
+                theme_scope_cookie_value,
+                note_fonts_cookie_value,
+                note_fonts_scope_cookie_value,
+            )
         )
 
         # אם לא התקבל אף שדה עדכני ואין צורך בקוקיז – אין מה לעדכן
@@ -17458,6 +18090,13 @@ def api_ui_prefs():
             if theme_scope_cookie_value is not None:
                 if theme_scope_cookie_value not in _THEME_SCOPE_VALUES:
                     theme_scope_cookie_value = None
+            if note_fonts_cookie_value is not None:
+                # ערך צפוי: מחרוזת ביטים באורך מספר המשטחים
+                if not _NOTE_FONTS_COOKIE_RE.fullmatch(str(note_fonts_cookie_value)):
+                    note_fonts_cookie_value = None
+            if note_fonts_scope_cookie_value is not None:
+                if note_fonts_scope_cookie_value not in _THEME_SCOPE_VALUES:
+                    note_fonts_scope_cookie_value = None
 
             if font_scale_cookie_value is not None:
                 resp.set_cookie(
@@ -17482,6 +18121,29 @@ def api_ui_prefs():
                 resp.set_cookie(
                     'ui_theme_scope',
                     scope_value,
+                    max_age=365*24*3600,
+                    samesite='Lax',
+                    secure=True,
+                    httponly=True,
+                )
+            if note_fonts_cookie_value is not None:
+                resp.set_cookie(
+                    'ui_note_fonts',
+                    note_fonts_cookie_value,
+                    max_age=365*24*3600,
+                    samesite='Lax',
+                    secure=True,
+                    httponly=True,
+                )
+            if note_fonts_scope_cookie_value is not None:
+                nf_scope_value = (
+                    THEME_SCOPE_DEVICE
+                    if note_fonts_scope_cookie_value == THEME_SCOPE_DEVICE
+                    else THEME_SCOPE_GLOBAL
+                )
+                resp.set_cookie(
+                    'ui_note_fonts_scope',
+                    nf_scope_value,
                     max_age=365*24*3600,
                     samesite='Lax',
                     secure=True,
@@ -18840,14 +19502,7 @@ def public_share(share_id):
             lines_count = len(code_str.split('\n')) if code_str else 0
         except Exception:
             lines_count = 0
-    created_at = doc.get('created_at')
-    if isinstance(created_at, datetime):
-        created_at_str = created_at.strftime('%d/%m/%Y %H:%M')
-    else:
-        try:
-            created_at_str = datetime.fromisoformat(created_at).strftime('%d/%m/%Y %H:%M') if created_at else ''
-        except Exception:
-            created_at_str = ''
+    created_at_str = format_datetime_display(doc.get('created_at'))
 
     file_data = {
         'id': share_id,

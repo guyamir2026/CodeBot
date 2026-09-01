@@ -97,7 +97,11 @@ class BotConfig(BaseSettings):
     # Cache/Redis
     REDIS_URL: Optional[str] = Field(default=None, description="Redis URL")
     CACHE_ENABLED: bool = Field(
-        default=False, description="Enable in-memory/Redis caching where applicable"
+        default=True,
+        description=(
+            "Enable caching. Requires REDIS_URL to be set; use false to turn "
+            "caching off without removing the URL"
+        ),
     )
     REDIS_MAX_CONNECTIONS: int = Field(
         default=50,
@@ -333,6 +337,11 @@ class BotConfig(BaseSettings):
         default="https://amirbiron.github.io/CodeBot/", description="Docs URL"
     )
     BOT_LABEL: str = Field(default="CodeBot", description="Bot label for UI")
+    # אימוג'י מותאם (טלגרם פרימיום) לאייקון ZIP בהודעות הבוט; ריק/None => אימוג'י רגיל.
+    # ה-ID הוא משאב חיצוני (חבילת צד ג') ולכן חי רק ב-ENV — לא מוטבע בקוד.
+    CUSTOM_EMOJI_ZIP_ID: Optional[str] = Field(
+        default=None, description="Custom emoji ID for ZIP icon (Telegram premium)"
+    )
     DRIVE_ADD_HASH: bool = Field(
         default=False, description="Append hash to filenames to avoid collisions"
     )

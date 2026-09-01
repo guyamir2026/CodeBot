@@ -19,6 +19,7 @@ from services import google_drive_service as gdrive
 from config import config
 from file_manager import backup_manager
 from handlers.drive.utils import extract_schedule_key
+from i18n.strings_he import BTN_BACKUP_ZIPS
 from utils import TelegramUtils
 
 logger = logging.getLogger(__name__)
@@ -496,6 +497,7 @@ class GoogleDriveMenuHandler:
         # Connected -> show main backup selection directly per requested flow
         await self._render_simple_selection(update, context, header_prefix="Google Drive — מחובר\n")
 
+    # docs:drive-callback-open:start — הקטע מוטמע בתיעוד (docs/conversation-handlers.rst); אל תסיר את הסימון
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user_id = query.from_user.id
@@ -508,6 +510,7 @@ class GoogleDriveMenuHandler:
         # Backward compatibility: map old callback to new one
         if data == "drive_advanced":
             data = "drive_sel_adv"
+    # docs:drive-callback-open:end
         if data == "drive_auth":
             __import__('logging').getLogger(__name__).warning(f"Drive: start auth by user {user_id}")
             try:
@@ -697,7 +700,7 @@ class GoogleDriveMenuHandler:
                 saved_zips = []
             sess = self._session(user_id)
             if sess.get("selected_category") == "zip":
-                await query.answer("כבר נבחר 'קבצי ZIP'", show_alert=False)
+                await query.answer(f"כבר נבחר '{BTN_BACKUP_ZIPS}'", show_alert=False)
                 return
             sess["selected_category"] = "zip"
             # שמירת בחירה אחרונה בפרפרנסים כדי שתשרוד דיפלוי
@@ -706,7 +709,7 @@ class GoogleDriveMenuHandler:
                 get_files_facade().save_drive_prefs(user_id, {"last_selected_category": "zip"})
             except Exception:
                 pass
-            prefix = "ℹ️ לא נמצאו קבצי ZIP שמורים בבוט. באישור לא יועלה דבר.\n\n" if not saved_zips else "✅ נבחר: קבצי ZIP\n\n"
+            prefix = "ℹ️ לא נמצאו קבצי גיבוי שמורים בבוט. באישור לא יועלה דבר.\n\n" if not saved_zips else f"✅ נבחר: {BTN_BACKUP_ZIPS}\n\n"
             await self._render_simple_selection(update, context, header_prefix=prefix)
             return
         if data == "drive_sel_all":
@@ -1146,11 +1149,11 @@ class GoogleDriveMenuHandler:
                         [InlineKeyboardButton("📦 צור ZIP שמור בבוט", callback_data="drive_make_zip_now")],
                         [InlineKeyboardButton("🔙 חזרה", callback_data="drive_backup_now")],
                     ]
-                    await query.edit_message_text("ℹ️ לא נמצאו קבצי ZIP שמורים בבוט. אפשר ליצור עכשיו ZIP שמור בבוט או לבחור 🧰 הכל.", reply_markup=InlineKeyboardMarkup(kb))
+                    await query.edit_message_text("ℹ️ לא נמצאו קבצי גיבוי שמורים בבוט. אפשר ליצור עכשיו ZIP שמור בבוט או לבחור 🧰 הכל.", reply_markup=InlineKeyboardMarkup(kb))
                     return
                 # פידבק מיידי לפני פעולת העלאה שעלולה לקחת זמן
                 try:
-                    await query.edit_message_text("⏳ מעלה קבצי ZIP ל‑Drive…\nזה עשוי לקחת כמה דקות.\n🔔 תתקבל הודעה בסיום.")
+                    await query.edit_message_text("⏳ מעלה קבצי גיבוי ל‑Drive…\nזה עשוי לקחת כמה דקות.\n🔔 תתקבל הודעה בסיום.")
                 except Exception:
                     pass
                 # הרצת ההעלאה בת׳רד נפרד כדי לא לחסום את הלולאה האסינכרונית
@@ -1231,7 +1234,7 @@ class GoogleDriveMenuHandler:
                 fn, data_bytes = gdrive.create_full_backup_zip_bytes(user_id, category="all")
                 ok = _backup_service.save_backup_bytes(data_bytes, {"backup_id": os.path.splitext(fn)[0], "user_id": user_id, "backup_type": "manual"})
                 if ok:
-                    await query.edit_message_text("✅ נוצר ZIP שמור בבוט. עכשיו ניתן לבחור שוב '📦 קבצי ZIP' להעלאה ל‑Drive.")
+                    await query.edit_message_text(f"✅ נוצר ZIP שמור בבוט. עכשיו ניתן לבחור שוב '{BTN_BACKUP_ZIPS}' להעלאה ל‑Drive.")
                 else:
                     await query.edit_message_text("❌ יצירת ה‑ZIP נכשלה. נסה שוב מאוחר יותר.")
             except Exception:
@@ -1343,7 +1346,7 @@ class GoogleDriveMenuHandler:
         type_emoji = ""
         if category == "zip":
             type_emoji = "📦"
-            typ = "קבצי ZIP"
+            typ = "קבצי גיבוי"
         elif category == "all":
             type_emoji = "🧰"
             typ = "הכל"
@@ -1400,7 +1403,7 @@ class GoogleDriveMenuHandler:
             sess["all_done"] = False
         # הצג וי ירוק על הבחירה הפעילה (מוצג גם בכותרת למעלה)
         active = selected or sess.get("last_upload")
-        zip_label = ("✅ " if active == "zip" else "") + "📦 קבצי ZIP"
+        zip_label = ("✅ " if active == "zip" else "") + BTN_BACKUP_ZIPS
         all_label = ("✅ " if active == "all" else "") + "🧰 הכל"
         folder_label = self._folder_button_label(user_id)
         schedule_label = self._schedule_button_label(user_id)
@@ -1476,7 +1479,7 @@ class GoogleDriveMenuHandler:
             "📚 מדריך גיבוי ל‑Google Drive\n"
             "━━━━━━━━━━━━━━━━━━━\n\n"
             "🎯 סוגי גיבוי:\n"
-            "• 📦 קבצי ZIP - מעלה קבצי ZIP שכבר שמורים בבוט\n"
+            f"• {BTN_BACKUP_ZIPS} - מעלה קבצי ZIP שכבר שמורים בבוט\n"
             "   └ אם אין ZIP שמורים, ניתן ליצור באמצעות 'צור ZIP שמור בבוט'\n"
             "• 🧰 הכל - יוצר גיבוי מלא חדש של כל הקבצים ומעלה ל‑Drive\n"
             "   └ הגיבוי נשמר בתיקיית 'הכל' עם תאריך ושעה\n\n"
@@ -1518,7 +1521,7 @@ class GoogleDriveMenuHandler:
         schedule = self._schedule_button_label(user_id).replace("🕑 ", "")
         txt = (
             "סיכום הגדרות:\n"
-            f"• סוג גיבוי אחרון: {('קבצי ZIP' if last_upload=='zip' else ('הכל' if last_upload=='all' else '—'))}\n"
+            f"• סוג גיבוי אחרון: {('קבצי גיבוי' if last_upload=='zip' else ('הכל' if last_upload=='all' else '—'))}\n"
             f"• תיקיית יעד: {folder}\n"
             f"• תזמון: {schedule if schedule != '🗓 זמני גיבוי' else 'לא נקבע'}\n"
         )

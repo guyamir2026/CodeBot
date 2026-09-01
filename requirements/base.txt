@@ -24,6 +24,10 @@ aiohttp==3.13.1
 httpx==0.28.1
 py_vapid==1.9.4  # 1.9.2 breaks with cryptography>=46 ("curve must be an EllipticCurve instance"); 1.9.3 has broken tar (absolute symlink)
 pywebpush==2.2.0
+# תלות משנית של pywebpush (המוצהר שם הוא http-ece>=1.1.0 — טווח פתוח).
+# היא מבצעת את הצפנת ה-payload ונשענת על cryptography, ולכן שדרוג שקט שלה
+# יכול לשבור שליחת פוש בלי שום שינוי בקוד. ננעל במפורש.
+http-ece==1.2.1
 
 # Google APIs (Drive OAuth + Client)
 google-api-python-client==2.185.0
@@ -47,6 +51,9 @@ playwright==1.49.0
 # Utilities
 python-dateutil==2.9.0.post0
 pytz==2025.2
+# מסד אזורי הזמן עבור zoneinfo. בלעדיו ZoneInfo("Asia/Jerusalem") נופל
+# בסביבות שאין בהן tzdata מערכתי, ותצוגת הזמנים חוזרת ל-UTC בשקט.
+tzdata==2026.3
 click==8.3.0
 arrow==1.4.0
 
@@ -77,6 +84,10 @@ gevent==24.11.1
 uvicorn==0.38.0
 whitenoise==6.11.0
 Flask-Compress==1.20
+
+# MCP server (Model Context Protocol) — exposes user files to Claude via mcp_server/
+# Compatible with the existing pins above (uvicorn>=0.31, pydantic>=2.11, httpx 0.28.x, starlette).
+mcp==1.28.1
 
 # Rate limiting (Flask + generic)
 Flask-Limiter==4.0.0

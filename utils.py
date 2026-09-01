@@ -20,9 +20,10 @@ import zipfile
 from html import escape as html_escape
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from functools import wraps
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from zoneinfo import ZoneInfo
 
 # Try to use the new domain CodeNormalizer when available (backwards compatible)
 try:  # pragma: no cover - optional import during gradual refactor
@@ -156,9 +157,50 @@ class CodeErrorLogger:
 # יצירת אינסטנס גלובלי של הלוגר
 code_error_logger = CodeErrorLogger()
 
+# אזור הזמן שבו מוצגים תאריכים למשתמש. המוצר ישראלי, והשרת רץ ב-UTC,
+# ולכן כל תצוגה חייבת לעבור המרה — אחרת רואים שעה מוקדמת בשעתיים-שלוש.
+ISRAEL_TZ_NAME = "Asia/Jerusalem"
+
+
+@lru_cache(maxsize=1)
+def _get_israel_tz():
+    """טוען את אזור הזמן פעם אחת בלבד.
+
+    אם מסד אזורי הזמן חסר בסביבה, עדיף להציג UTC מאשר להפיל את הדף — אבל
+    נפילה שקטה כזו מחזירה בדיוק את הבאג שההמרה נועדה לתקן, ולכן היא
+    נרשמת ללוג. ה-cache דואג שהאזהרה תופיע פעם אחת ולא בכל תצוגת תאריך.
+    """
+    try:
+        return ZoneInfo(ISRAEL_TZ_NAME)
+    except Exception as exc:
+        logger.warning(
+            "timezone_database_missing",
+            extra={"timezone": ISRAEL_TZ_NAME, "error": str(exc)},
+        )
+        return timezone.utc
+
+
 class TimeUtils:
     """כלים לעבודה עם זמן ותאריכים"""
-    
+
+    ISRAEL_TZ_NAME = ISRAEL_TZ_NAME
+
+    @staticmethod
+    def to_israel_time(dt: datetime) -> datetime:
+        """המרת תאריך לשעון ישראל, כולל טיפול בשעון קיץ.
+
+        תאריך בלי אזור זמן נחשב UTC, כי ככה מונגו שומר אותו. שים לב להבדל
+        בין replace ל-astimezone: הראשון רק מדביק תווית ומשאיר את השעה
+        כמו שהיא, והשני באמת מזיז את השעון. שניהם נחוצים כאן, בסדר הזה.
+
+        ערך שאינו datetime מוחזר כמו שהוא. זו הגנה מכוונת: הפונקציה יושבת
+        בשכבת התצוגה, ושדה חסר או פגום במסמך לא אמור להפיל עמוד שלם.
+        """
+        if not isinstance(dt, datetime):
+            return dt
+        aware = dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        return aware.astimezone(_get_israel_tz())
+
     @staticmethod
     def format_relative_time(dt: datetime) -> str:
         """פורמט זמן יחסי (לפני 5 דקות, אתמול וכו')"""
@@ -1318,6 +1360,19 @@ def detect_language_from_filename(filename: str) -> str:
     # אם לא נמצאה התאמה, נחזיר 'text'
     return 'text'
 
+def tg_emoji(emoji_id: Optional[str], fallback: str) -> str:
+    """מחזיר תג <tg-emoji> לאימוג'י מותאם של טלגרם, או את האימוג'י הרגיל כשאין ID.
+
+    לשימוש בגוף הודעה עם parse_mode=HTML בלבד — כפתורי inline keyboard לא תומכים
+    ב-message entities, ולכן שם משתמשים תמיד באימוג'י רגיל. השליחה עלולה להיכשל
+    כשהתנאי הפרימיום לא מתקיים — באחריות הקורא לתפוס BadRequest ולשלוח מחדש עם
+    ה-fallback (ראו _maybe_store_zip_copy ב-handlers/documents.py).
+    """
+    if not emoji_id:
+        return fallback
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+
 def get_language_emoji(language: str) -> str:
     """מחזיר אימוג'י מתאים לשפת התכנות"""
     emoji_map = {
@@ -1363,28 +1418,65 @@ def get_language_emoji(language: str) -> str:
     
     return emoji_map.get(language.lower(), '📄')
 
+# טוקן של בוט טלגרם — מגיע ללוגים דרך כתובות ה-API (‎/bot<TOKEN>/method).
+# מקור אמת יחיד: הדפוס הציבורי מ-telegram_api. אין עותק מקומי — עותק כזה
+# מתפצל בשקט מהמקור בכל שינוי, וזה גרוע יותר מכשל ייבוא קולני (telegram_api
+# תלוי רק בספריה הסטנדרטית, כך שכשל הייבוא כאן בלתי אפשרי בפועל).
+from telegram_api import REDACTION_PATTERNS as _SHARED_REDACTION_PATTERNS
+
+
 class SensitiveDataFilter(logging.Filter):
     """מסנן שמטשטש טוקנים ונתונים רגישים בלוגים."""
+
+    # כל דפוסי הניקוי במקום אחד — ההודעה וה-traceback עוברים דרך אותה רשימה,
+    # כך שאי אפשר להוסיף דפוס למסלול אחד ולשכוח את השני
+    # הדפוסים המשותפים (טוקן טלגרם + סוד בשורת שאילתה) מיובאים מ-
+    # ``telegram_api`` ולא משוכפלים כאן: כשלכל רשת הייתה רשימה משלה, הוספת
+    # דפוס הגיעה לאחת ולא לשנייה. הדפוסים שמתחת ייחודיים ללוגים.
+    _PATTERNS = [
+        (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "ghp_***REDACTED***"),
+        (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "github_pat_***REDACTED***"),
+        (re.compile(r"Bearer\s+[A-Za-z0-9\-_.=:/+]{10,}"), "Bearer ***REDACTED***"),
+        *_SHARED_REDACTION_PATTERNS,
+    ]
+
+    @classmethod
+    def _redact_text(cls, text: str) -> str:
+        for pat, repl in cls._PATTERNS:
+            text = pat.sub(repl, text)
+        return text
+
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            msg = str(record.getMessage())
-            # זיהוי בסיסי של טוקנים: ghp_..., github_pat_..., Bearer ...
-            patterns = [
-                (r"ghp_[A-Za-z0-9]{20,}", "ghp_***REDACTED***"),
-                (r"github_pat_[A-Za-z0-9_]{20,}", "github_pat_***REDACTED***"),
-                (r"Bearer\s+[A-Za-z0-9\-_.=:/+]{10,}", "Bearer ***REDACTED***"),
-            ]
-            redacted = msg
-            import re as _re
-            for pat, repl in patterns:
-                redacted = _re.sub(pat, repl, redacted)
-            # עדכן רק את message הפורמטי
-            record.msg = redacted
+            record.msg = self._redact_text(str(record.getMessage()))
             # חשוב: נקה ארגומנטים כדי למנוע ניסיון פורמט חוזר (%s) שיוביל ל-TypeError
             record.args = ()
+            # Formatter.format מדביק את ה-traceback אחרי ההודעה, ולכן סוד בתוך
+            # טקסט החריגה (למשל URL של טלגרם בחריגת רשת) ידלוף גם אם ההודעה נקייה.
+            # מנקים רק כשבאמת נמצא סוד, כדי לא לפגוע במבנה החריגה במקרה הרגיל.
+            self._redact_exception(record)
         except Exception:
             pass
         return True
+
+    @classmethod
+    def _redact_exception(cls, record: logging.LogRecord) -> None:
+        try:
+            exc_text = record.exc_text
+            if not exc_text and record.exc_info:
+                import traceback as _tb
+
+                exc_text = "".join(_tb.format_exception(*record.exc_info))
+            if not exc_text:
+                return
+            cleaned = cls._redact_text(exc_text)
+            if cleaned != exc_text:
+                # Formatter.format משתמש ב-exc_text כשהוא כבר מוגדר ולא מרנדר את
+                # exc_info מחדש, ולכן די בקאש המנוקה. את exc_info משאירים — Sentry
+                # בונה ממנו את החריגה המובנית ומנקה אותה ב-before_send.
+                record.exc_text = cleaned
+        except Exception:
+            pass
 
 
 def install_sensitive_filter():
@@ -1580,3 +1672,152 @@ def normalize_code(text: str,
     except Exception:
         # במקרה של שגיאה, החזר את הטקסט המקורי
         return text
+
+
+# ----- כלי יצירת ZIP מרוכז (בטוח מפני Zip-Slip + חסום-מגבלות, טהור וניתן להרצה ב-thread) -----
+
+# מגבלות זרימת "יצירת ZIP" בבוט (מספר קבצים וגודל מצטבר) — הגנה מפני צריכת זיכרון/DoS
+ZIP_CREATE_MAX_FILES = 50
+ZIP_CREATE_MAX_TOTAL_BYTES = 45 * 1024 * 1024  # 45MB (מתחת למגבלת שליחת document של טלגרם)
+
+
+def safe_zip_entry_name(name, fallback: str = "file") -> str:
+    """מחזיר שם רשומת ZIP בטוח: basename בלבד, ללא נתיב מוחלט/מקונן/‏‎".."/".‎"; אחרת fallback.
+
+    מונע Zip-Slip: שמות כמו '../../etc/passwd' או '/abs/x' מנורמלים לשם בסיס בטוח.
+    """
+    raw = str(name or "").replace("\\", "/")
+    base = os.path.basename(raw)  # מסיר כל רכיב נתיב (absolute/nested)
+    cleaned = TextUtils.clean_filename(base)  # מסיר תווים אסורים + נקודות מובילות/סוגרות
+    if not cleaned or cleaned in (".", ".."):
+        return fallback
+    return cleaned
+
+
+def build_zip_bytes(items, *, max_files: int = ZIP_CREATE_MAX_FILES,
+                    max_total_bytes: int = ZIP_CREATE_MAX_TOTAL_BYTES) -> bytes:
+    """בונה ZIP (סינכרוני, טהור) מרשימת פריטים [{'filename': str, 'bytes': bytes}].
+
+    - מנקה כל שם רשומה דרך safe_zip_entry_name (הגנת Zip-Slip).
+    - אוכף מגבלת מספר קבצים וגודל מצטבר (הגנה כפולה מעבר לאיסוף).
+    - שמות רשומה כפולים מקבלים סיומת ממספרת (x.txt, x_2.txt) לשמירת ייחודיות.
+    - מדלג בשקט על פריט בודד שנכשל (שומר על ההתנהגות הקיימת).
+
+    מיועד להרצה תחת asyncio.to_thread כדי לא לחסום את לולאת האירועים.
+    """
+    from io import BytesIO
+    buf = BytesIO()
+    total = 0
+    count = 0
+    used = set()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for i, it in enumerate(items or []):
+            if count >= max_files:
+                break
+            try:
+                data = it.get("bytes") or b""
+                if total + len(data) > max_total_bytes:
+                    break
+                entry = safe_zip_entry_name(it.get("filename"), fallback=f"file_{i + 1}")
+                # מניעת שמות כפולים: משמרים את הראשון, ולבאים מוסיפים סיומת ממספרת (עם שמירת הסיומת)
+                if entry in used:
+                    stem, ext = os.path.splitext(entry)
+                    n = 2
+                    entry = f"{stem}_{n}{ext}"
+                    while entry in used:
+                        n += 1
+                        entry = f"{stem}_{n}{ext}"
+                used.add(entry)
+                z.writestr(entry, data)
+                total += len(data)
+                count += 1
+            except Exception:
+                # שמירה על ההתנהגות הקיימת: פריט בעייתי מדולג ולא מפיל את כל ה-ZIP
+                continue
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ----- ניהול ZIP ממתין לבחירת יעד (סקיל/גיבוי) ברגע ההעלאה -----
+# ה-bytes נשמרים בקובץ זמני עד שהמשתמש בוחר כפתור; המטא הקטן נשמר ב-user_data.
+# המחיקות מוגבלות לתת-תיקייה ייעודית בלבד (allowlist), לפי כללי הבטיחות של הריפו.
+
+PENDING_ZIP_SUBDIR = "codebot_pending_zip"
+PENDING_ZIP_TTL_SECONDS = 3600  # שעה — קובץ ממתין שלא נבחר נחשב נטוש ומנוקה
+# תבנית token בטוח לשם קובץ (uuid/hex) — בלי מפרידי נתיב או רכיבי traversal
+_SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _pending_zip_dir() -> Path:
+    """מחזיר (ויוצר) את תיקיית ה-ZIP הממתינים — תת-תיקייה ייעודית תחת tmp."""
+    d = Path(tempfile.gettempdir()) / PENDING_ZIP_SUBDIR
+    d.mkdir(parents=True, exist_ok=True)
+    # הידוק הרשאות לפרטיות המשתמש (הקבצים מכילים קוד שהמשתמש העלה)
+    try:
+        os.chmod(d, 0o700)
+    except Exception:
+        pass
+    return d
+
+
+def _is_under_pending_dir(path: Path) -> bool:
+    """בטיחות מחיקה: מוודא שהנתיב באמת מתחת לתיקיית ה-pending הייעודית (ולא היא עצמה)."""
+    try:
+        base = _pending_zip_dir().resolve()
+        rp = path.resolve()
+        return rp != base and base in rp.parents
+    except Exception:
+        return False
+
+
+def stash_pending_zip_bytes(raw: bytes, token: str) -> str:
+    """שומר bytes של ZIP ממתין לבחירה בקובץ זמני ומחזיר את הנתיב המלא.
+
+    ה-token חייב להיות מזהה בטוח לשם קובץ (ללא מפרידי נתיב או '..').
+    """
+    if not token or not _SAFE_TOKEN_RE.match(token):
+        raise ValueError("invalid pending-zip token")
+    # בטוח מ-path traversal: _SAFE_TOKEN_RE מתיר רק [A-Za-z0-9_-] (בלי '/', '\' או '..'),
+    # ולכן הנתיב המורכב כאן נשאר תמיד בתוך _pending_zip_dir()
+    path = _pending_zip_dir() / f"{token}.bin"
+    with open(path, "wb") as f:
+        f.write(raw)
+    return str(path)
+
+
+def load_pending_zip_bytes(path: str) -> Optional[bytes]:
+    """קורא bytes של ZIP ממתין מהנתיב שנשמר, או None אם לא קיים/מחוץ ל-allowlist."""
+    try:
+        p = Path(path)
+        if not _is_under_pending_dir(p) or not p.exists():
+            return None
+        return p.read_bytes()
+    except Exception:
+        return None
+
+
+def cleanup_pending_zip(path: str) -> None:
+    """מוחק קובץ ZIP ממתין בודד (רק אם הוא מתחת לתיקיית ה-pending הייעודית)."""
+    try:
+        if not path:
+            return
+        p = Path(path)
+        if _is_under_pending_dir(p) and p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def cleanup_stale_pending_zips(max_age_seconds: int = PENDING_ZIP_TTL_SECONDS) -> None:
+    """מנקה קבצי ZIP ממתינים ישנים (שלא נבחרו) — סורק רק קבצי .bin בתיקייה הייעודית."""
+    try:
+        d = _pending_zip_dir()
+        now = time.time()
+        for f in d.glob("*.bin"):
+            try:
+                if now - f.stat().st_mtime > max_age_seconds:
+                    f.unlink()
+            except Exception:
+                continue
+    except Exception:
+        pass

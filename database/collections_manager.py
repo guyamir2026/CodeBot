@@ -206,6 +206,8 @@ class CollectionsManager:
             self.collections.create_indexes([
                 IndexModel([("user_id", ASCENDING), ("slug", ASCENDING)], name="user_slug_unique", unique=True),
                 IndexModel([("user_id", ASCENDING), ("is_active", ASCENDING), ("updated_at", DESCENDING)], name="user_active_updated"),
+                # תומך בסינון הרשימה לפי ארכיון (is_archived) יחד עם מיון לפי updated_at
+                IndexModel([("user_id", ASCENDING), ("is_active", ASCENDING), ("is_archived", ASCENDING), ("updated_at", DESCENDING)], name="user_active_archived_updated"),
                 # חיפוש מהיר לפי שם (למשל "שולחן עבודה") תחת user_id + is_active
                 IndexModel([("user_id", ASCENDING), ("is_active", ASCENDING), ("name", ASCENDING)], name="user_active_name"),
                 IndexModel([("user_id", ASCENDING), ("sort_order", ASCENDING)], name="user_sort_order"),
@@ -236,6 +238,15 @@ class CollectionsManager:
                 self.items.update_many(
                     {"$or": [{"folder": None}, {"folder": {"$exists": False}}]},
                     {"$set": {"folder": ""}},
+                )
+            except Exception:
+                pass
+            # backfill — אוספים קיימים ללא is_archived יקבלו False (לניקיון וליעילות אינדקס;
+            # התקינות מובטחת גם בלעדיו בזכות $ne:True בשאילתת הרשימה)
+            try:
+                self.collections.update_many(
+                    {"is_archived": {"$exists": False}},
+                    {"$set": {"is_archived": False}},
                 )
             except Exception:
                 pass
@@ -687,6 +698,7 @@ class CollectionsManager:
             "items_count": 0,
             "pinned_count": 0,
             "is_active": True,
+            "is_archived": False,
             "created_at": _now(),
             "updated_at": _now(),
         }
@@ -745,6 +757,8 @@ class CollectionsManager:
             updates["color"] = self._normalize_color(fields.get("color"))
         if "is_favorite" in fields:
             updates["is_favorite"] = bool(fields.get("is_favorite"))
+        if "is_archived" in fields:
+            updates["is_archived"] = bool(fields.get("is_archived"))
         if "sort_order" in fields and isinstance(fields.get("sort_order"), int):
             updates["sort_order"] = int(fields.get("sort_order"))
         if "mode" in fields:
@@ -791,14 +805,21 @@ class CollectionsManager:
             emit_event("collections_delete_error", severity="error", user_id=int(user_id), error=str(e))
             return {"ok": False, "error": "שגיאה במחיקת האוסף"}
 
-    def list_collections(self, user_id: int, limit: int = 100, skip: int = 0) -> Dict[str, Any]:
+    def list_collections(self, user_id: int, limit: int = 100, skip: int = 0, *, archived_only: bool = False, include_archived: bool = False) -> Dict[str, Any]:
         try:
             eff_limit = max(1, min(int(limit or 100), 500))
             eff_skip = max(0, int(skip or 0))
         except Exception:
             eff_limit, eff_skip = 100, 0
 
-        flt = {"user_id": user_id, "is_active": True}
+        # ברירת מחדל: רק אוספים פעילים שאינם בארכיון. תצוגת ארכיון: רק המאורכבים.
+        # include_archived=True (למשל גיבוי אישי): כל האוספים הפעילים, כולל בארכיון.
+        # ($ne:True מכסה גם אוספים ישנים שעדיין אין בהם את השדה is_archived)
+        flt: Dict[str, Any] = {"user_id": user_id, "is_active": True}
+        if archived_only:
+            flt["is_archived"] = True
+        elif not include_archived:
+            flt["is_archived"] = {"$ne": True}
 
         try:
             found = self.collections.find(flt)
@@ -1286,11 +1307,7 @@ class CollectionsManager:
         החזרת מטאדאטה על כל התגיות הזמינות.
 
         Returns:
-            dict: {
-                "allowed_tags": [...],
-                "categories": {...},
-                "metadata": {...}
-            }
+            dict: מילון עם המפתחות ``allowed_tags``, ``categories`` ו-``metadata``.
         """
         cache_key = "collections:tags_metadata"
         cache_obj = cache
@@ -1448,6 +1465,8 @@ class CollectionsManager:
             try:
                 t0 = time.perf_counter()
                 active_map: Dict[Tuple[str, str], bool] = {}
+                # (source, file_name) -> description של הקובץ, לאייקון התיאור בכרטיס
+                desc_map: Dict[Tuple[str, str], str] = {}
                 # אסוף זוגות ייחודיים (source, file_name) מהעמוד בלבד
                 uniq: List[Tuple[str, str]] = []
                 seen_keys: set[Tuple[str, str]] = set()
@@ -1467,25 +1486,28 @@ class CollectionsManager:
                     for _fn in names:
                         active_map[(source, _fn)] = bool(value)
 
-                def _batch_active_names(coll: Any, names: set[str]) -> set[str]:
-                    # החזר קבוצת file_name שקיימים כ"פעילים". אם נכשל – זרוק חריגה כדי לאפשר fail-open.
+                def _batch_active_names(coll: Any, names: set[str]) -> dict[str, str]:
+                    # החזר מיפוי file_name -> description לקבצים "פעילים" (מפתחות המיפוי הם
+                    # הקבצים הפעילים; הערך הוא תיאור הקובץ, אם קיים). אם נכשל – זרוק חריגה
+                    # כדי לאפשר fail-open.
                     query = {
                         "user_id": int(user_id),
                         "file_name": {"$in": list(names)},
                         # לאחר המיגרציה: פילטר ישיר וידידותי לאינדקסים
                         "is_active": True,
                     }
-                    # מספיק לנו רק file_name
-                    projection = {"file_name": 1}
+                    # file_name לחישוב פעילות + description לאייקון התיאור (שדה קל,
+                    # לא code/content — נשמר חוק ה-Smart Projection)
+                    projection = {"file_name": 1, "description": 1}
                     rows = coll.find(query, projection=projection)
                     docs = list(rows) if not isinstance(rows, list) else rows
-                    out: set[str] = set()
+                    out: dict[str, str] = {}
                     for d in docs:
                         if not isinstance(d, dict):
                             continue
                         fnv = d.get("file_name")
                         if fnv:
-                            out.add(str(fnv))
+                            out[str(fnv)] = str(d.get("description") or "")
                     return out
 
                 regular_names: set[str] = set()
@@ -1505,6 +1527,8 @@ class CollectionsManager:
                             active_regular = _batch_active_names(self.code_snippets, regular_names)
                             for fn in regular_names:
                                 active_map[("regular", fn)] = bool(fn in active_regular)
+                                if fn in active_regular:
+                                    desc_map[("regular", fn)] = active_regular[fn]
                         except Exception:
                             # fail-open: אם יש כשל במסד – נניח פעיל כדי לא להסתיר פריטים
                             _mark_all("regular", regular_names, True)
@@ -1522,6 +1546,8 @@ class CollectionsManager:
                                 active_large_fallback = _batch_active_names(self.code_snippets, large_names)
                                 for fn in large_names:
                                     active_map[("large", fn)] = bool(fn in active_large_fallback)
+                                    if fn in active_large_fallback:
+                                        desc_map[("large", fn)] = active_large_fallback[fn]
                             except Exception:
                                 # fail-open: אם יש כשל במסד – נניח פעיל כדי לא להסתיר פריטים
                                 _mark_all("large", large_names, True)
@@ -1530,6 +1556,8 @@ class CollectionsManager:
                             active_large = _batch_active_names(self.large_files, large_names)
                             for fn in large_names:
                                 active_map[("large", fn)] = bool(fn in active_large)
+                                if fn in active_large:
+                                    desc_map[("large", fn)] = active_large[fn]
                         except Exception:
                             # fail-open: אם יש כשל במסד – נניח פעיל כדי לא להסתיר פריטים
                             _mark_all("large", large_names, True)
@@ -1545,6 +1573,7 @@ class CollectionsManager:
                 t_compute_active = max(0.0, time.perf_counter() - t0)
             except Exception:
                 active_map = {}
+                desc_map = {}
 
             # החזרה (כולל is_file_active לכל פריט)
             t0 = time.perf_counter()
@@ -1553,6 +1582,8 @@ class CollectionsManager:
                 item_pub = self._public_item(x)
                 key = (str(item_pub.get("source") or "regular"), str(item_pub.get("file_name") or ""))
                 item_pub["is_file_active"] = bool(active_map.get(key, True))
+                # תיאור הקובץ (אם קיים) — לאייקון התיאור בכרטיס; ריק אם אין/לא-פעיל
+                item_pub["description"] = desc_map.get(key, "")
                 items_out.append(item_pub)
             t_public_map = max(0.0, time.perf_counter() - t0)
 
@@ -1750,6 +1781,7 @@ class CollectionsManager:
             "items_count": int(d.get("items_count") or 0),
             "pinned_count": int(d.get("pinned_count") or 0),
             "is_active": bool(d.get("is_active", True)),
+            "is_archived": bool(d.get("is_archived", False)),
             "created_at": (d.get("created_at").isoformat() if isinstance(d.get("created_at"), datetime) else None),
             "updated_at": (d.get("updated_at").isoformat() if isinstance(d.get("updated_at"), datetime) else None),
             "share": {

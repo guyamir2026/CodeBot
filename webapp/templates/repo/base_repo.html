@@ -9,6 +9,8 @@
 {% endblock %}
 
 {% block extra_head %}
+{% set note_font_surface = 'repo' %}
+{% include "_note_fonts_head.html" with context %}
 <!-- CodeMirror 5 (פשוט יותר לשימוש) -->
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
@@ -22,8 +24,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 
 <!-- Custom Repo Browser Styles -->
-<link rel="stylesheet" href="{{ url_for('static', filename='css/repo-browser.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/repo-browser.css') }}?v={{ static_version }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/markdown-enhanced.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/sticky-notes.css') }}?v={{ static_version }}">
 {% endblock %}
 
 {% block content %}
@@ -67,7 +70,7 @@
             </span>
             {% if metadata %}
             <span class="repo-stats">
-                <i class="bi bi-file-code"></i> {{ metadata.total_files | default(0) }} files
+                <i class="bi bi-file-code"></i> <span data-repo-stat="total_files">{{ metadata.total_files | default(0) }}</span> files
             </span>
             {% endif %}
             {% if user_is_admin %}
@@ -314,9 +317,7 @@
             <div class="sidebar-footer">
                 {% if metadata %}
                 <div class="stats-mini">
-                    <span title="Python files"><i class="bi bi-filetype-py"></i> {{ metadata.get('file_types', {}).get('python', 0) }}</span>
-                    <span title="JavaScript files"><i class="bi bi-filetype-js"></i> {{ metadata.get('file_types', {}).get('javascript', 0) }}</span>
-                    <span title="Total files"><i class="bi bi-files"></i> {{ metadata.total_files | default(0) }}</span>
+                    <span title="Total files"><i class="bi bi-files"></i> <span data-repo-stat="total_files">{{ metadata.total_files | default(0) }}</span> files</span>
                 </div>
                 {% else %}
                 <div class="stats-mini">
@@ -393,6 +394,9 @@
 <script src="{{ url_for('static', filename='js/admonition-icons.js') }}"></script>
 <script src="{{ url_for('static', filename='js/utils/rtl-code.js') }}"></script>
 <script src="{{ url_for('static', filename='js/utils/safe-highlight.js') }}"></script>
+<script src="{{ url_for('static', filename='js/md-anchors.js') }}"></script>
 <script src="{{ url_for('static', filename='js/live-preview.js') }}"></script>
-<script src="{{ url_for('static', filename='js/repo-browser.js') }}"></script>
+<script src="{{ url_for('static', filename='js/repo-browser.js') }}?v={{ static_version }}"></script>
+<script src="{{ url_for('static', filename='js/sticky-notes.js') }}?v={{ static_version }}"></script>
+<script src="{{ url_for('static', filename='js/repo-notes.js') }}?v={{ static_version }}"></script>
 {% endblock %}

@@ -1,0 +1,791 @@
+"""Pure tool handlers.
+
+These are plain functions (no MCP / no Starlette imports) that validate and
+clamp inputs, then delegate to a ``Backend``. Keeping them separate from the
+FastMCP wiring makes the business logic trivially unit-testable.
+
+Every handler takes an authoritative, server-derived ``user_id`` — callers must
+never pass a client-supplied user id here.
+"""
+
+from __future__ import annotations
+
+import html
+import re
+from typing import Any
+
+# תקרת התוכן מיובאת ולא מוקלדת. עד היום MCP והוובאפ החזיקו כל אחד את המספר
+# שלו, כך ששינוי באחד היה משאיר את השני אוכף ערך אחר — ואז אותו פתק נדחה
+# בערוץ אחד ומתקבל בשני.
+from sticky_notes_target import MAX_NOTE_CHARS as MAX_NOTE_CONTENT
+
+MAX_PER_PAGE = 200
+MAX_SEARCH_LIMIT = 100
+MAX_COLLECTIONS_LIMIT = 500
+# Fallback when the app config isn't importable (kept in sync with config.MAX_CODE_SIZE).
+DEFAULT_MAX_CODE_SIZE = 100_000
+
+
+def _clamp(value: Any, lo: int, hi: int, default: int) -> int:
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, ivalue))
+
+
+def list_files(backend: Any, user_id: int, *, page: int = 1, per_page: int = 50) -> dict[str, Any]:
+    return backend.list_files(
+        user_id,
+        page=_clamp(page, 1, 10**9, 1),
+        per_page=_clamp(per_page, 1, MAX_PER_PAGE, 50),
+    )
+
+
+def search_code(
+    backend: Any, user_id: int, *, query: str, language: str | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    query = (query or "").strip()
+    if not query:
+        return []
+    return backend.search_code(
+        user_id,
+        query=query,
+        language=(language or None),
+        limit=_clamp(limit, 1, MAX_SEARCH_LIMIT, 20),
+    )
+
+
+def get_file(
+    backend: Any,
+    user_id: int,
+    *,
+    file_name: str | None = None,
+    file_id: str | None = None,
+    version: int | None = None,
+) -> dict[str, Any] | None:
+    if not file_name and not file_id:
+        return None
+    return backend.get_file(user_id, file_name=file_name, file_id=file_id, version=version)
+
+
+def list_versions(backend: Any, user_id: int, *, file_name: str) -> list[dict[str, Any]]:
+    if not file_name:
+        return []
+    return backend.list_versions(user_id, file_name=file_name)
+
+
+def list_collections(backend: Any, user_id: int, *, limit: int = 100) -> dict[str, Any]:
+    return backend.list_collections(user_id, limit=_clamp(limit, 1, MAX_COLLECTIONS_LIMIT, 100))
+
+
+def get_collection(backend: Any, user_id: int, *, collection_id: str) -> dict[str, Any]:
+    if not collection_id:
+        return {"ok": False, "error": "missing_collection_id"}
+    return backend.get_collection(user_id, collection_id=collection_id)
+
+
+def get_collection_items(
+    backend: Any,
+    user_id: int,
+    *,
+    collection_id: str,
+    page: int = 1,
+    per_page: int = 50,
+    folder: str | None = None,
+) -> dict[str, Any]:
+    if not collection_id:
+        return {"ok": False, "error": "missing_collection_id"}
+    return backend.get_collection_items(
+        user_id,
+        collection_id=collection_id,
+        page=_clamp(page, 1, 10**9, 1),
+        per_page=_clamp(per_page, 1, MAX_PER_PAGE, 50),
+        folder=folder,
+    )
+
+
+def _max_code_size() -> int:
+    """The app's per-file size gate (characters, not bytes), with a safe fallback."""
+    try:
+        from config import config as _cfg
+
+        return int(getattr(_cfg, "MAX_CODE_SIZE", DEFAULT_MAX_CODE_SIZE))
+    except Exception:
+        return DEFAULT_MAX_CODE_SIZE
+
+
+def save_file(
+    backend: Any,
+    user_id: int,
+    *,
+    file_name: str,
+    code: str,
+    language: str | None = None,
+    description: str = "",
+) -> dict[str, Any]:
+    """Validate + normalize a save request, then delegate to the backend.
+
+    All app imports are lazy/guarded so this module stays trivially importable
+    (and unit-testable) without the config/services stack.
+    """
+    name = (file_name or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing_file_name"}
+    if not isinstance(code, str) or code == "":
+        return {"ok": False, "error": "empty_code"}
+
+    # Reject oversize content (the large-file path is non-versioned; out of scope
+    # here). Mirror the app's own gate, which counts characters, not bytes.
+    max_size = _max_code_size()
+    if len(code) > max_size:
+        return {"ok": False, "error": "code_too_large", "max": max_size}
+
+    # Auto-detect the language when the caller didn't specify one.
+    lang = (language or "").strip()
+    if not lang:
+        try:
+            from services.code_service import detect_language
+
+            lang = detect_language(code, name) or "text"
+        except Exception:
+            lang = "text"
+
+    return backend.save_file(
+        user_id,
+        file_name=name,
+        code=code,
+        programming_language=lang,
+        description=(description or "").strip(),
+    )
+
+
+def _apply_edit(
+    code: str, old_string: str, new_string: str, replace_all: bool
+) -> tuple[str | None, int, str | None]:
+    """Pure exact find-and-replace (native Edit-tool semantics).
+
+    Returns ``(new_code, occurrences, error)`` — exactly one of new_code/error
+    is set. ``occurrences`` is how many matches were found, so an
+    ``ambiguous_match`` error can report the count.
+    """
+    if old_string == "":
+        return None, 0, "empty_old_string"
+    if old_string == new_string:
+        return None, 0, "old_and_new_identical"
+    count = code.count(old_string)
+    if count == 0:
+        return None, 0, "no_match"
+    if count > 1 and not replace_all:
+        return None, count, "ambiguous_match"
+    return code.replace(old_string, new_string), count, None
+
+
+def _load_editable(backend: Any, user_id: int, name: str) -> tuple[dict[str, Any] | None, str]:
+    """Fetch the latest version of ``name`` for editing. Returns (doc, code)."""
+    doc = backend.get_file(user_id, file_name=name, file_id=None, version=None)
+    if not doc:
+        return None, ""
+    code = doc.get("code")
+    return doc, code if isinstance(code, str) else ""
+
+
+def _resave_edited(
+    backend: Any, user_id: int, *, name: str, doc: dict[str, Any], new_code: str
+) -> dict[str, Any]:
+    """Persist an edited body as a new version, preserving the file's metadata.
+
+    Language, description and tags are carried over from the fetched version so
+    an edit never resets them; the same size gate as ``save_file`` applies to
+    the resulting body.
+    """
+    max_size = _max_code_size()
+    if len(new_code) > max_size:
+        return {"ok": False, "error": "code_too_large", "max": max_size}
+    return backend.save_file(
+        user_id,
+        file_name=name,
+        code=new_code,
+        programming_language=str(doc.get("programming_language") or doc.get("language") or "text"),
+        description=str(doc.get("description") or ""),
+        tags=list(doc.get("tags") or []),
+    )
+
+
+def edit_file(
+    backend: Any,
+    user_id: int,
+    *,
+    file_name: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+) -> dict[str, Any]:
+    """Server-side find-and-replace on the latest version of an existing file.
+
+    The client sends only the changed snippet (old/new) — never the whole file.
+    The result goes through the same append-only versioned save path, so the
+    pre-edit version stays recoverable via ``list_versions``.
+    """
+    name = (file_name or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing_file_name"}
+    if not isinstance(old_string, str) or not isinstance(new_string, str):
+        return {"ok": False, "error": "invalid_arguments"}
+    doc, code = _load_editable(backend, user_id, name)
+    if doc is None:
+        return {"ok": False, "error": "not_found"}
+    if code == "":
+        return {"ok": False, "error": "empty_file"}
+    new_code, occurrences, err = _apply_edit(code, old_string, new_string, bool(replace_all))
+    if err is not None or new_code is None:
+        out: dict[str, Any] = {"ok": False, "error": err or "edit_failed"}
+        if err == "ambiguous_match":
+            out["occurrences"] = occurrences
+            out["hint"] = "pass a longer unique old_string, or set replace_all=true"
+        return out
+    res = _resave_edited(backend, user_id, name=name, doc=doc, new_code=new_code)
+    if not res.get("ok"):
+        return res
+    return {"ok": True, "replacements": occurrences, "file": res.get("file")}
+
+
+def append_file(backend: Any, user_id: int, *, file_name: str, content: str) -> dict[str, Any]:
+    """Append ``content`` to the end of an existing file (as a new version).
+
+    A newline separator is inserted when the current body doesn't end with one,
+    so an appended section always starts on a fresh line.
+    """
+    name = (file_name or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing_file_name"}
+    if not isinstance(content, str) or content == "":
+        return {"ok": False, "error": "empty_content"}
+    doc, code = _load_editable(backend, user_id, name)
+    if doc is None:
+        return {"ok": False, "error": "not_found"}
+    if code == "":
+        return {"ok": False, "error": "empty_file"}
+    sep = "" if code.endswith("\n") else "\n"
+    res = _resave_edited(backend, user_id, name=name, doc=doc, new_code=code + sep + content)
+    if not res.get("ok"):
+        return res
+    return {"ok": True, "appended_chars": len(content), "file": res.get("file")}
+
+
+# -- sticky notes ----------------------------------------------------------
+
+MAX_NOTES_PER_SCOPE = 200
+MAX_ANCHOR_TEXT = 256
+MAX_NOTE_LINE = 1_000_000
+DEFAULT_NOTE_COLOR = "#FFFFCC"
+# sentinel של הוובאפ לפתק "צף": בלעדיו ה-JS מעגן פתק חדש אוטומטית לשורה הקרובה
+NOTE_FLOATING_ANCHOR = "__floating__"
+
+_NOTE_ID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
+_NOTE_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{3,8}$")
+# עותק של webapp/sticky_notes_api.py:_CONTROL_CHARS_RE — לשמור מסונכרן
+_NOTE_CONTROL_CHARS_RE = re.compile(r"[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]")
+
+
+def _sanitize_note_text(text: Any) -> str:
+    """Normalize note text like the webapp does — without truncating.
+
+    Length is the caller's decision (reject, not clip): silent clipping is data
+    loss an agent won't notice.
+    """
+    if text is None:
+        return ""
+    try:
+        s = str(text)
+    except Exception:
+        return ""
+    s = html.unescape(s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return _NOTE_CONTROL_CHARS_RE.sub("", s)
+
+
+def _valid_note_line(line: Any) -> int | None:
+    """Coerce a 1-indexed source line; None on invalid."""
+    try:
+        line_i = int(line)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= line_i <= MAX_NOTE_LINE:
+        return None
+    return line_i
+
+
+def _clean_anchor_text(anchor_text: Any) -> str | None:
+    text = _sanitize_note_text(anchor_text).strip()
+    # קיטום קוסמטי בלבד (פריטת הוובאפ) — לא תוכן משתמש שאסור לאבד
+    return text[:MAX_ANCHOR_TEXT] or None
+
+
+def list_notes(backend: Any, user_id: int, *, file_name: str) -> dict[str, Any]:
+    """List the user's sticky notes attached to ``file_name`` (read-only)."""
+    name = (file_name or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing_file_name"}
+    return backend.list_notes(user_id, file_name=name)
+
+
+def create_note(
+    backend: Any,
+    user_id: int,
+    *,
+    file_name: str,
+    content: str,
+    line: int | None = None,
+    color: str | None = None,
+    anchor_text: str | None = None,
+) -> dict[str, Any]:
+    """Attach a sticky note to an existing file.
+
+    With ``line`` the note anchors to that 1-indexed source line; without it the
+    note is created floating (explicit sentinel — otherwise the web client
+    auto-anchors it to the nearest line on first render).
+    """
+    name = (file_name or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing_file_name"}
+
+    clean = _sanitize_note_text(content).strip()
+    if not clean:
+        return {"ok": False, "error": "empty_content"}
+    if len(clean) > MAX_NOTE_CONTENT:
+        return {"ok": False, "error": "content_too_long", "max": MAX_NOTE_CONTENT}
+
+    line_i: int | None = None
+    if line is not None:
+        line_i = _valid_note_line(line)
+        if line_i is None:
+            return {"ok": False, "error": "invalid_line", "min": 1, "max": MAX_NOTE_LINE}
+
+    color_s = (color or "").strip()
+    if not _NOTE_COLOR_RE.match(color_s):
+        color_s = DEFAULT_NOTE_COLOR  # ביצירה: צבע לא חוקי נופל לברירת המחדל
+
+    return backend.create_note(
+        user_id,
+        file_name=name,
+        content=clean,
+        line=line_i,
+        color=color_s,
+        anchor_text=_clean_anchor_text(anchor_text),
+        anchor_id=None if line_i else NOTE_FLOATING_ANCHOR,
+    )
+
+
+#: מזהה לוח הוא ObjectId, בדיוק כמו ``note_id``.
+_BOARD_ID_RE = _NOTE_ID_RE
+
+
+def list_boards(backend: Any, user_id: int) -> dict[str, Any]:
+    """List the user's note boards (read-only)."""
+    return backend.list_boards(user_id)
+
+
+def list_board_notes(backend: Any, user_id: int, *, board_id: str) -> dict[str, Any]:
+    """List the sticky notes sitting on one board (read-only)."""
+    bid = (board_id or "").strip()
+    if not _BOARD_ID_RE.match(bid):
+        return {"ok": False, "error": "invalid_board_id"}
+    return backend.list_board_notes(user_id, board_id=bid)
+
+
+def create_board_note(
+    backend: Any,
+    user_id: int,
+    *,
+    board_id: str,
+    content: str,
+    color: str | None = None,
+    mode: str | None = None,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Attach a sticky note to a board (a surface that belongs to no file).
+
+    ``mode`` בוחר בין ``surface`` (יושב על הלוח, ברירת המחדל) לבין
+    ``screen`` (צף מול המסך). ``anchored`` אינו חוקי כאן — הוא דורש שורות
+    מקור, ובלוח אין כאלה; פתק כזה היה מחשב מיקום מול עוגן שאינו קיים.
+    """
+    from sticky_notes_target import (
+        DEFAULT_BOARD_MODE, is_valid_board_mode, normalize_mode, normalize_note_title,
+    )
+
+    bid = (board_id or "").strip()
+    if not _BOARD_ID_RE.match(bid):
+        return {"ok": False, "error": "invalid_board_id"}
+
+    clean = _sanitize_note_text(content).strip()
+    if not clean:
+        return {"ok": False, "error": "empty_content"}
+    if len(clean) > MAX_NOTE_CONTENT:
+        return {"ok": False, "error": "content_too_long", "max": MAX_NOTE_CONTENT}
+
+    if mode is not None and not is_valid_board_mode(mode):
+        return {"ok": False, "error": "invalid_mode", "allowed": ["surface", "screen"]}
+
+    # אותה ולידציה בדיוק כמו ב-``create_note``: צבע לא חוקי נופל לברירת המחדל
+    color_s = (color or "").strip()
+    if not _NOTE_COLOR_RE.match(color_s):
+        color_s = DEFAULT_NOTE_COLOR
+
+    return backend.create_board_note(
+        user_id,
+        board_id=bid,
+        content=clean,
+        color=color_s,
+        mode=normalize_mode(mode, DEFAULT_BOARD_MODE),
+        title=normalize_note_title(title),
+    )
+
+
+# -- פתקי ריפו: היעד השלישי ------------------------------------------------
+#
+# **ולידציית שם הריפו כאן היא בדיקת צורה, ולא הדפוס הקנוני.** המודול הזה
+# טהור, ו-``REPO_NAME_PATTERN`` יושב במודול שמייבא ``subprocess``. הבדיקה
+# הסמכותית ממילא ב-backend — מול רשימת הריפואים הממוררים בפועל, שהיא מקור
+# אמת חזק מכל דפוס.
+MAX_REPO_NAME = 100
+
+#: תקרת תוצאות חיפוש. הכלי חוצה שלושה יעדים, ותשובה ארוכה מזו כבר לא
+#: עוזרת לאתר פתק — היא רק דוחפת את השאר מהקשר.
+MAX_NOTE_SEARCH_RESULTS = 50
+DEFAULT_NOTE_SEARCH_RESULTS = 20
+
+
+def _clean_repo_name(repo_name: Any) -> str | None:
+    """שם ריפו כשהוא תקין בצורתו, אחרת ``None``.
+
+    ``/`` נדחה כי שם עם לוכסן היה נראה כמו ``owner/repo`` ומייצר יעד שאינו
+    מתלכד עם מה ש-``repo_metadata`` מחזיק — כלומר פתק שלעולם לא יימצא.
+    """
+    name = str(repo_name or "").strip()
+    if not name or "/" in name or len(name) > MAX_REPO_NAME:
+        return None
+    return name
+
+
+def list_repo_notes(backend: Any, user_id: int, *, repo_name: str, repo_path: str) -> dict[str, Any]:
+    """List the sticky notes on one file inside a mirrored repository (read-only)."""
+    from sticky_notes_target import normalize_repo_path
+
+    name = _clean_repo_name(repo_name)
+    if name is None:
+        return {"ok": False, "error": "invalid_repo_name"}
+
+    # **הנרמול קורה כאן, לפני ה-backend.** ``repo_files`` שומר נתיבים בצורת
+    # git הגולמית, ו-``normalize_repo_path`` מתכנס בדיוק אליה — כולל דחיית
+    # ``..``. בלי המעבר הזה נתיב שכתוב ``./a/../b.py`` היה שאילתה שאינה
+    # מוצאת דבר, בלי שום שגיאה.
+    path = normalize_repo_path(repo_path)
+    if not path:
+        return {"ok": False, "error": "invalid_repo_path"}
+
+    return backend.list_repo_notes(user_id, repo_name=name, repo_path=path)
+
+
+def create_repo_note(
+    backend: Any,
+    user_id: int,
+    *,
+    repo_name: str,
+    repo_path: str,
+    content: str,
+    color: str | None = None,
+    mode: str | None = None,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Attach a sticky note to a file inside a mirrored repository.
+
+    היעד הוא הזוג ``(repo_name, repo_path)`` **בלי ענף**: פתק שנרשם כשהיית
+    על ``main`` מופיע גם כשאתה על ענף PR — זו אותה שורת קוד.
+
+    ``mode`` זהה לזה של הלוח: ``surface``/``screen``. ``anchored`` אינו
+    חוקי — התצוגה בדפדפן הריפו היא CodeMirror, שאינו מרנדר שורות מחוץ
+    למסך, ולכן אין לו DOM להיצמד אליו.
+    """
+    from sticky_notes_target import (
+        DEFAULT_BOARD_MODE, is_valid_board_mode, normalize_mode, normalize_note_title,
+        normalize_repo_path,
+    )
+
+    # **אותם שערים בדיוק כמו במסלול הקריאה, ובאותו סדר.** שני מסלולים
+    # שגוזרים שערים שונים הם שני מושגים שונים של "יעד חוקי".
+    name = _clean_repo_name(repo_name)
+    if name is None:
+        return {"ok": False, "error": "invalid_repo_name"}
+    path = normalize_repo_path(repo_path)
+    if not path:
+        return {"ok": False, "error": "invalid_repo_path"}
+
+    clean = _sanitize_note_text(content).strip()
+    if not clean:
+        return {"ok": False, "error": "empty_content"}
+    if len(clean) > MAX_NOTE_CONTENT:
+        return {"ok": False, "error": "content_too_long", "max": MAX_NOTE_CONTENT}
+
+    if mode is not None and not is_valid_board_mode(mode):
+        return {"ok": False, "error": "invalid_mode", "allowed": ["surface", "screen"]}
+
+    color_s = (color or "").strip()
+    if not _NOTE_COLOR_RE.match(color_s):
+        color_s = DEFAULT_NOTE_COLOR
+
+    return backend.create_repo_note(
+        user_id,
+        repo_name=name,
+        repo_path=path,
+        content=clean,
+        color=color_s,
+        mode=normalize_mode(mode, DEFAULT_BOARD_MODE),
+        title=normalize_note_title(title),
+    )
+
+
+def list_repo_note_paths(backend: Any, user_id: int, *, repo_name: str) -> dict[str, Any]:
+    """Which files inside a mirrored repo carry sticky notes (read-only).
+
+    **מפה, לא תוכן.** ``list_repo_notes`` דורש ``repo_name`` **וגם**
+    ``repo_path`` מדויק — כלומר צריך כבר לדעת איפה הפתק כדי למצוא אותו.
+    בלי הכלי הזה כל פתקי הריפו הם לשימוש עצמי בלבד: מי שלא רשם אותם אינו
+    יכול לגלות אותם.
+
+    אותה ולידציית שם כמו ב-``list_repo_notes``, ומאותה סיבה: שם עם ``/``
+    מייצר יעד שאינו מתלכד עם ``repo_metadata``, כלומר שאילתה שלעולם לא
+    תמצא דבר.
+    """
+    name = _clean_repo_name(repo_name)
+    if not name:
+        return {"ok": False, "error": "invalid_repo_name"}
+    return backend.list_repo_note_paths(user_id, repo_name=name)
+
+
+def add_to_collection(
+    backend: Any,
+    user_id: int,
+    *,
+    collection_id: str,
+    file_name: str,
+    folder: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Attach an existing saved file to an existing collection.
+
+    **כלי נפרד, ולא פרמטר ל-``save_file``.** שמירה שמצליחה ושיוך שנכשל
+    הם הצלחה חלקית של שתי פעולות שנקשרו לאחת — ואז הודעת ההצלחה מתארת
+    מחצית ממה שקרה. שני כלים נותנים לכל פעולה תשובה כנה משלה; המחיר הוא
+    קריאה שנייה.
+
+    האימות עצמו חי ב-backend, לצד השאילתה שהוא מגן עליה.
+    """
+    cid = (collection_id or "").strip()
+    if not _NOTE_ID_RE.match(cid):
+        return {"ok": False, "error": "invalid_collection_id"}
+    name = (file_name or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing_file_name"}
+    return backend.add_to_collection(
+        user_id, collection_id=cid, file_name=name, folder=folder, note=note
+    )
+
+
+def note_str_replace(
+    backend: Any,
+    user_id: int,
+    *,
+    note_id: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+) -> dict[str, Any]:
+    """Exact find-and-replace inside one sticky note.
+
+    **אותו** ``_apply_edit`` **של** ``edit_file``, ובכוונה: שתי מימושים
+    של "מצא והחלף" נבדלים בדיוק במקרי הקצה — התאמה מרובה, מחרוזת ריקה,
+    ישן שווה לחדש — ואלה בדיוק המקרים שבהם ההבדל עולה בנתונים. גם נוסחי
+    השגיאה זהים, כדי שסוכן שלמד אחד יכיר את השני.
+
+    הקריאה עוברת דרך ``update_note``, ולכן היא יורשת את הצילום שנשמר
+    לפני הדריסה — וזו הסיבה שהסדר בין השניים אינו הפיך: ``str_replace``
+    בלי היסטוריה היה מוסיף עוד מסלול שדורס בלי ממה לשחזר.
+
+    **‏read-modify-write נושא שער אופטימי.** הגוף שנקרא כאן מועבר
+    ל-``update_note`` כ-``expected_content``, והדריסה מותנית בכך שהוא
+    עדיין הגוף שבמסד. בלעדיו שתי עריכות חופפות היו קוראות את אותו גוף,
+    שתיהן מדווחות הצלחה, והאחרונה מוחקת את עריכת הראשונה — הצילום היה
+    משמר את הגוף **הישן**, לא את העריכה שאבדה. המפסיד מקבל ``conflict``:
+    קריאה חוזרת של הפתק וניסיון נוסף הם התשובה הנכונה, לא ניצחון שקרי.
+    """
+    nid = (note_id or "").strip()
+    if not _NOTE_ID_RE.match(nid):
+        return {"ok": False, "error": "invalid_note_id"}
+    if not isinstance(old_string, str) or not isinstance(new_string, str):
+        return {"ok": False, "error": "invalid_arguments"}
+
+    current = backend.get_note(user_id, note_id=nid)
+    if not isinstance(current, dict) or not current.get("ok"):
+        return {"ok": False, "error": str((current or {}).get("error") or "not_found")}
+    body = str((current.get("note") or {}).get("content") or "")
+    if body == "":
+        return {"ok": False, "error": "empty_note"}
+
+    # הקלט מנורמל כמו שהתוכן נורמל בכתיבה — אחרת ``old_string`` עם CRLF
+    # לא היה תופס גוף שנשמר עם ``\n`` בלבד.
+    old_clean = _sanitize_note_text(old_string)
+    new_clean = _sanitize_note_text(new_string)
+    new_body, occurrences, err = _apply_edit(body, old_clean, new_clean, bool(replace_all))
+    if err is not None or new_body is None:
+        out: dict[str, Any] = {"ok": False, "error": err or "edit_failed"}
+        if err == "ambiguous_match":
+            out["occurrences"] = occurrences
+            out["hint"] = "pass a longer unique old_string, or set replace_all=true"
+        return out
+    if not new_body.strip():
+        return {"ok": False, "error": "empty_content"}
+    if len(new_body) > MAX_NOTE_CONTENT:
+        return {"ok": False, "error": "content_too_long", "max": MAX_NOTE_CONTENT}
+
+    res = backend.update_note(
+        user_id, note_id=nid, fields={"content": new_body}, expected_content=body
+    )
+    if not res.get("ok"):
+        if res.get("error") == "conflict":
+            res = dict(res)
+            res["hint"] = "the note changed since it was read — re-read it and retry"
+        return res
+    return {"ok": True, "replacements": occurrences, "note": res.get("note")}
+
+
+def list_note_versions(backend: Any, user_id: int, *, note_id: str) -> dict[str, Any]:
+    """Previous revisions of a note — metadata only, newest first."""
+    nid = (note_id or "").strip()
+    if not _NOTE_ID_RE.match(nid):
+        return {"ok": False, "error": "invalid_note_id"}
+    return backend.list_note_versions(user_id, note_id=nid)
+
+
+def get_note_version(backend: Any, user_id: int, *, note_id: str, version: int) -> dict[str, Any]:
+    """Read the content of one previous revision."""
+    nid = (note_id or "").strip()
+    if not _NOTE_ID_RE.match(nid):
+        return {"ok": False, "error": "invalid_note_id"}
+    try:
+        ver = int(version)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_version"}
+    if ver < 1:
+        return {"ok": False, "error": "invalid_version"}
+    return backend.get_note_version(user_id, note_id=nid, version=ver)
+
+
+def search_notes(
+    backend: Any,
+    user_id: int,
+    *,
+    query: str,
+    limit: int | None = None,
+    search_content: bool = False,
+) -> dict[str, Any]:
+    """Find sticky notes across all three targets (read-only).
+
+    **שם כברירת מחדל; תוכן בבקשה מפורשת.** חיפוש השם נשען על
+    ``user_title_idx``; הרחבתו לתוכן מוסיפה פרדיקט שאין עליו אינדקס —
+    מונגו מתיר אינדקס טקסט אחד לכל אוסף, וזו החלטה חד-כיוונית שלא נשרפת
+    כאן. הסריקה נשארת חסומה ל-``user_id`` ולכן אינה COLLSCAN.
+
+    **הדגל קיים בגלל פתק בלי שם.** רוב הפתקים נכתבים בלי כותרת, ולכן היו
+    בלתי-נראים לחיפוש לחלוטין — לא "קשים למציאה", אלא בלתי-ניתנים
+    למציאה.
+
+    **אורך השאילתה נבדק מול היעד.** תקרת ``MAX_NOTE_TITLE`` נגזרת מכך
+    ששאילתה ארוכה משם אפשרי לעולם לא תתפוס דבר — נימוק שאינו חל על
+    התוכן, שמגיע עד ``MAX_NOTE_CONTENT``. בדיקה אחת לשני מרחבים הייתה
+    פוסלת חיפושים לגיטימיים בגוף הפתק.
+
+    ``limit`` **נחתך ולא נדחה**: מספר גדול מדי הוא בקשה לרוחב, לא שגיאה.
+    """
+    from sticky_notes_target import MAX_NOTE_TITLE, canonical_title_text
+
+    # **מחט לכל יעד, כי היעדים נשמרו אחרת.**
+    #
+    # שם עובר ``canonical_title_text`` בכתיבה: כיווץ רצפי רווחים ואיחוד
+    # לשורה אחת. תוכן עובר ``_sanitize_note_text``, ש**משמר** את שניהם.
+    # מחט אחת לשני הפרדיקטים שוברת בדיוק אחד מהם: מחט קנונית מפספסת
+    # תוכן רב-שורתי, ומחט גולמית מפספסת שם שנשמר מכווץ — כלומר הדלקת
+    # הדגל הייתה **מורידה** התאמות-שם במקום רק להוסיף התאמות-גוף. זה
+    # בדיוק הכשל השקט ש-``repo_notes_filter`` מתעד: נכתב בצורה אחת,
+    # מחופש בצורה אחרת.
+    #
+    # **בלי קיצוץ** באף מחט, כי אחריו בדיקת האורך שמתחת הייתה תמיד
+    # שקרית: ``normalize_note_title`` כבר חתך ל-80.
+    title_needle = canonical_title_text(query)
+    content_needle = _sanitize_note_text(query).strip() if search_content else ""
+    # מחט השם נבדקת מול תקרת השם; ארוכה ממנה — אין שם כזה, והענף מושמט
+    # (בחיפוש-שם-בלבד זו שאילתה שלעולם לא תתפוס, ולכן שגיאה מפורשת).
+    if len(title_needle) > MAX_NOTE_TITLE:
+        if not search_content:
+            return {"ok": False, "error": "query_too_long", "max": MAX_NOTE_TITLE}
+        title_needle = ""
+    if search_content and len(content_needle) > MAX_NOTE_CONTENT:
+        return {"ok": False, "error": "query_too_long", "max": MAX_NOTE_CONTENT}
+    # בדיקת הריקנות רצה **אחרי** ההשמטות, לא לפניהן: שאילתה שמחט-השם שלה
+    # הושמטה (ארוכה מדי) ומחט-התוכן שלה התרוקנה בניקוי הייתה עוברת בדיקה
+    # מוקדמת — ומפילה את בונה השאילתה על שתי מחטים ריקות במקום להיענות
+    # ב-``empty_query``.
+    if not title_needle and not content_needle:
+        return {"ok": False, "error": "empty_query"}
+
+    return backend.search_notes(
+        user_id,
+        query=title_needle,
+        limit=_clamp(limit, 1, MAX_NOTE_SEARCH_RESULTS, DEFAULT_NOTE_SEARCH_RESULTS),
+        search_content=bool(search_content),
+        content_query=content_needle or None,
+    )
+
+
+def update_note(
+    backend: Any,
+    user_id: int,
+    *,
+    note_id: str,
+    content: str | None = None,
+    line: int | None = None,
+    color: str | None = None,
+    anchor_text: str | None = None,
+    is_minimized: bool | None = None,
+) -> dict[str, Any]:
+    """Partial update of a sticky note by its id (in-place, no version history)."""
+    nid = (note_id or "").strip()
+    if not _NOTE_ID_RE.match(nid):
+        return {"ok": False, "error": "invalid_note_id"}
+
+    fields: dict[str, Any] = {}
+    if content is not None:
+        clean = _sanitize_note_text(content).strip()
+        if not clean:
+            return {"ok": False, "error": "empty_content"}
+        if len(clean) > MAX_NOTE_CONTENT:
+            return {"ok": False, "error": "content_too_long", "max": MAX_NOTE_CONTENT}
+        fields["content"] = clean
+    if line is not None:
+        line_i = _valid_note_line(line)
+        if line_i is None:
+            return {"ok": False, "error": "invalid_line", "min": 1, "max": MAX_NOTE_LINE}
+        # מעבר לעיגון-שורה מנקה עוגני כותרת/sentinel — כמו הקליינט של הוובאפ
+        fields.update({"line_start": line_i, "anchor_id": None, "line_end": None})
+    if color is not None:
+        color_s = (color or "").strip()
+        if _NOTE_COLOR_RE.match(color_s):
+            fields["color"] = color_s  # בעדכון: צבע לא חוקי נשמט, לא מוחלף בברירת מחדל
+    if anchor_text is not None:
+        fields["anchor_text"] = _clean_anchor_text(anchor_text)
+    if is_minimized is not None:
+        fields["is_minimized"] = bool(is_minimized)
+
+    if not fields:
+        return {"ok": False, "error": "no_fields_to_update"}
+    return backend.update_note(user_id, note_id=nid, fields=fields)

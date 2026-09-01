@@ -10,6 +10,7 @@ from telegram.ext import ContextTypes
 
 from services import backup_service as backup_manager
 from handlers.pagination import build_pagination_row
+from i18n.strings_he import BTN_BACKUP_ZIPS
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +270,7 @@ class BackupMenuHandler:
             pass
         await message("בחר פעולה מתפריט הגיבוי/שחזור:", reply_markup=reply_markup)
     
+    # docs:backup-callback-dispatch:start — הקטע מוטמע בתיעוד (docs/conversation-handlers.rst); אל תסיר את הסימון
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user_id = query.from_user.id
@@ -300,6 +302,7 @@ class BackupMenuHandler:
         elif data.startswith("backup_details:"):
             backup_id = data.split(":", 1)[1]
             await self._show_backup_details(update, context, backup_id)
+    # docs:backup-callback-dispatch:end
         elif data.startswith("backup_rate_menu:"):
             # פתיחת מסך תיוג עם 3 כפתורים (🏆 / 👍 / 🤷)
             backup_id = data.split(":", 1)[1]
@@ -627,7 +630,7 @@ class BackupMenuHandler:
                     id_to_version[getattr(b, 'backup_id', '')] = idx
         except Exception:
             id_to_version = {}
-        lines = [f"📦 קבצי ZIP שמורים — סה\"כ: {total}\n📄 עמוד {page} מתוך {total_pages}\n"]
+        lines = [f"{BTN_BACKUP_ZIPS} שמורים — סה\"כ: {total}\n📄 עמוד {page} מתוך {total_pages}\n"]
         keyboard = []
         delete_mode = bool(context.user_data.get("backup_delete_mode"))
         selected = set(context.user_data.get("backup_delete_selected", set()))

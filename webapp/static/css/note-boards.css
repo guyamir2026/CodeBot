@@ -1,0 +1,403 @@
+/* לוחות פתקים — רשימה ומשטח.
+ *
+ * ``hidden`` מול ``display`` של המחבר: הדפדפן מגדיר ``[hidden]{display:none}``
+ * במקור ה-user-agent, וכל הכרזת ``display`` של המחבר מנצחת אותו — גם בלי
+ * ספציפיות גבוהה. ``.board-empty`` הגדיר ``display:flex``, ולכן הכיתוב
+ * "הלוח ריק" הוצג גם כשהיו פתקים על הלוח. הכלל הבא מחזיר ל-``hidden`` את
+ * המשמעות שלו בכל הקובץ, ולא רק במקום היחיד שנתפס.
+ *
+ * רשת הנקודות היא CSS טהור בכוונה: אפס נכסים, אפס ווטרמארק, ואפס בייטים
+ * להוריד. היא גם מקבלת את צבע ערכת הנושא הפעילה אוטומטית, מה שאיור סטטי
+ * לא היה עושה.
+ */
+
+[hidden] { display: none !important; }
+
+/* ---------- רשימת הלוחות ---------- */
+
+.boards-page {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 4rem;
+}
+
+.boards-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.5rem;
+}
+
+.boards-header h1 {
+  margin: 0;
+  font-size: 1.6rem;
+}
+
+.boards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 1rem;
+}
+
+.board-card {
+  padding: 1.1rem 1.2rem;
+  border-radius: 14px;
+  background: var(--card-bg, rgba(255, 255, 255, 0.9));
+  border: 1px solid var(--glass-border, rgba(0, 0, 0, 0.08));
+  color: var(--text-primary, #1f2933);
+  text-decoration: none;
+  transition: transform .15s ease, box-shadow .2s ease;
+}
+
+.board-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .12);
+}
+
+.board-card-link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+
+.board-card-title {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  font-weight: 600;
+  margin-bottom: .35rem;
+}
+
+.board-card-count {
+  font-size: .85rem;
+  color: var(--text-muted, #667);
+}
+
+.board-default-badge {
+  font-size: .7rem;
+  padding: .1rem .45rem;
+  border-radius: 999px;
+  background: var(--primary, #667eea);
+  color: #fff;
+  font-weight: 500;
+}
+
+.board-card-actions {
+  display: flex;
+  gap: .4rem;
+  margin-top: .75rem;
+}
+
+.board-action {
+  border: 1px solid var(--glass-border, rgba(0, 0, 0, .12));
+  background: var(--bg-secondary, #f7fafc);
+  color: var(--text-primary, inherit);
+  border-radius: 8px;
+  padding: .25rem .6rem;
+  font-size: .8rem;
+  cursor: pointer;
+}
+
+.board-action:hover { background: var(--glass-hover, rgba(103, 126, 234, .1)); }
+.board-action[disabled] { opacity: .45; cursor: not-allowed; }
+
+/* ---------- משטח הלוח ---------- */
+
+/* עמוד המשטח מנצל את כל הרוחב ורוב הגובה. ברשימת הלוחות עמודה צרה
+   היא הנכונה, אבל משטח עבודה שמוגבל ל-1100px משאיר שוליים מתים משני
+   הצדדים ועוד 4rem ריקים מתחתיו. */
+/* עמוד המשטח מנצל כמעט את כל המסך. נמדד לפני: שוליים 12/12 בצדדים אבל
+   168px מתים למעלה, והמשטח חרג מהמסך ב-40px — כי ``100vh - 130px`` היה
+   ניחוש קשיח שלא תאם את המיקום בפועל. */
+.boards-page.is-board-surface {
+  max-width: none;
+  padding: .4rem .5rem .5rem;
+}
+
+/* סרגל הכלים צף **מעל** המשטח במקום לשבת מעליו.
+   כך הלוח מתחיל מיד מתחת לנאבבר, והשורה שתפסה 40 פיקסלים מלאים
+   מפסיקה לגזול שטח מהלוח עצמו.
+   (העוגן ל-``position: absolute`` הזה הוא ``.board-surface-wrap``, שכבר
+   מוגדר ``position: relative`` בכלל הבסיס שלו בהמשך הקובץ.) */
+.is-board-surface .board-toolbar {
+  position: absolute;
+  inset-block-start: .5rem;
+  inset-inline-end: .6rem;
+  inset-inline-start: auto;
+  z-index: 5;
+  margin: 0;
+  gap: .4rem;
+  width: auto;
+  padding: .25rem .35rem;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-primary, #fff) 82%, transparent);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--glass-border, rgba(0, 0, 0, .08));
+}
+.is-board-surface .board-title-input {
+  font-size: 1rem;
+  padding: .1rem .4rem;
+  max-width: 40vw;
+}
+
+.board-surface-wrap {
+  position: relative;
+}
+
+.board-surface {
+  position: relative;      /* פתק במצב surface הוא absolute יחסית לזה */
+  /* ``--board-top`` נמדד ב-JS מהמיקום בפועל, במקום המספר הקשיח שפספס
+     ב-40px ויצר גלילה מיותרת. הערך הקשיח נשאר כנפילה חיננית בלבד. */
+  /* ``vh`` קודם כנפילה: דפדפן שאינו מכיר ``dvh`` מתעלם מההצהרה כולה,
+     ובלי השורה הזו המשטח היה מאבד את גובה המסך ומתכווץ לתוכן. */
+  min-height: calc(100vh - var(--board-top, 130px) - .5rem);
+  min-height: calc(100dvh - var(--board-top, 130px) - .5rem);
+  border-radius: 16px;
+  overflow: auto;
+  border: 1px solid var(--glass-border, rgba(0, 0, 0, .08));
+
+  /* רשת הנקודות.
+   *
+   * הצבע נגזר מ-``--text-primary`` של הערכה **הפעילה**, ולא משאילתת מדיה.
+   * הגרסה הקודמת השתמשה ב-``prefers-color-scheme``, שהיא הגדרת מערכת
+   * ההפעלה — בעוד שהאפליקציה בוחרת ערכה דרך ``data-theme`` על ``<html>``.
+   * כלומר צבע הנקודות נקבע לפי משהו שאין לו קשר לערכה שנבחרה: בערכה
+   * בהירה הן נעלמו לגמרי, ובכהות הן השתנו באקראי.
+   *
+   * ``color-mix`` כבר בשימוש בריפו (``codemirror-custom.css``). */
+  background-color: var(--bg-primary, #fff);
+  background-image: radial-gradient(
+    circle,
+    var(--board-dot, color-mix(in srgb, var(--text-primary, #1f2933) 26%, transparent)) 1px,
+    transparent 1px
+  );
+  background-size: 24px 24px;
+  /* מוצמד למשטח, כך שהנקודות זזות איתו בגלילה ולא "מחליקות" מתחתיו */
+  background-attachment: local;
+}
+
+.board-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: .75rem;
+  color: var(--text-muted, #667);
+  pointer-events: none;
+}
+
+.board-empty button { pointer-events: auto; }
+
+.board-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: .75rem;
+}
+
+.board-title-input {
+  font-size: 1.3rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: .25rem .5rem;
+  background: transparent;
+  color: var(--text-primary, inherit);
+  max-width: 100%;
+}
+
+.board-title-input:hover { border-color: var(--glass-border, rgba(0, 0, 0, .12)); }
+.board-title-input:focus { border-color: var(--primary, #667eea); outline: none; }
+
+.board-msg {
+  padding: .5rem .75rem;
+  border-radius: 8px;
+  font-size: .9rem;
+  margin-bottom: .75rem;
+}
+
+.board-msg.is-error { background: rgba(220, 53, 69, .12); color: #b02a37; }
+.board-msg.is-info { background: rgba(103, 126, 234, .12); }
+
+/* אין כאן שאילתת מדיה בכוונה: ``--text-primary`` כבר מתהפך עם הערכה,
+   ולכן הנקודות מתאימות את עצמן לכל ערכה — כולל ערכות שהמשתמש יצר. */
+
+/* קישור כאייקון — בלי טקסט. שטח נגיעה מלא למרות שהאייקון קטן. */
+.board-icon-link {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; flex: 0 0 auto;
+  border-radius: 8px;
+  border: 1px solid var(--glass-border, rgba(0, 0, 0, .12));
+  background: var(--bg-secondary, #f7fafc);
+  color: var(--text-primary, inherit);
+  text-decoration: none;
+}
+.board-icon-link:hover { background: var(--glass-hover, rgba(103, 126, 234, .12)); }
+.board-icon-link:focus-visible { outline: 2px solid var(--primary, #667eea); outline-offset: 2px; }
+
+/* ---------- הגדרות הלוח ---------- */
+
+.board-settings-modal { position: fixed; inset: 0; z-index: 1200; display: flex; align-items: center; justify-content: center; }
+.board-settings-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, .45); }
+.board-settings-card {
+  position: relative;
+  max-width: 26rem; width: calc(100% - 2rem);
+  background: var(--bg-primary, #fff); color: var(--text-primary, #1f2933);
+  border: 1px solid var(--glass-border, rgba(0, 0, 0, .12));
+  border-radius: 14px; padding: 1.2rem 1.3rem;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, .3);
+}
+.board-settings-card h2 { margin: 0 0 1rem; font-size: 1.15rem; }
+.board-setting-row { display: flex; gap: .6rem; align-items: flex-start; cursor: pointer; }
+.board-setting-row input { margin-top: .3rem; flex: 0 0 auto; }
+.board-setting-row small { display: block; color: var(--text-muted, #667); font-size: .85rem; margin-top: .15rem; }
+.board-settings-actions { display: flex; justify-content: flex-start; margin-top: 1rem; }
+
+/* ============================================================
+   מעבר מהיר בין לוחות, ולוחות נעוצים
+   ------------------------------------------------------------
+   הצבעים כאן נגזרים מ-docs/webapp/theming_and_css.rst: --card-bg
+   ו---card-border הם הטוקנים המיועדים ל"כרטיסים, מודלים,
+   dropdowns" לפי טבלת הטוקנים שם. אין HEX עצמאי — רק כ-fallback
+   בתוך var(), כמוסכמת שאר הקובץ.
+   ============================================================ */
+
+.board-modal[hidden] { display: none; }
+.board-modal {
+  position: fixed; inset: 0; z-index: 1200;
+  display: flex; align-items: center; justify-content: center;
+  padding: 1rem;
+}
+.board-modal .modal-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0, 0, 0, .45);
+}
+.board-modal .modal-content {
+  position: relative;
+  width: 100%; max-width: 520px; max-height: 78vh;
+  display: flex; flex-direction: column;
+  background: var(--card-bg, #fff);
+  color: var(--text-primary, #1f2933);
+  border: 1px solid var(--card-border, var(--glass-border, rgba(0, 0, 0, .12)));
+  border-radius: 16px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, .3);
+  animation: boardModalIn .22s ease;
+}
+@keyframes boardModalIn {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .board-modal .modal-content { animation: none; }
+}
+.board-modal .modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: .75rem; padding: 1rem 1.15rem;
+  border-bottom: 1px solid var(--card-border, var(--glass-border, rgba(0, 0, 0, .12)));
+}
+.board-modal .modal-header h3 {
+  margin: 0; font-size: 1.05rem; color: var(--text-primary, #1f2933);
+}
+.board-modal .modal-close {
+  background: none; border: none; cursor: pointer;
+  font-size: 1.15rem; line-height: 1; padding: .3rem .45rem; border-radius: 8px;
+  color: var(--text-secondary, var(--text-muted, #667));
+}
+.board-modal .modal-close:hover { color: var(--text-primary, #1f2933); }
+.board-modal .modal-close:focus-visible {
+  outline: 2px solid var(--primary, #667eea); outline-offset: 2px;
+}
+.board-modal .modal-body { padding: 1rem 1.15rem 1.2rem; overflow-y: auto; }
+
+/* -- אריחי המעבר המהיר -- */
+.board-tiles {
+  display: grid; gap: .8rem;
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+}
+.board-tile {
+  display: flex; flex-direction: column; align-items: center; gap: .45rem;
+  padding: .55rem .35rem; border-radius: 12px;
+  text-decoration: none; border: 1px solid transparent;
+  background: none; cursor: pointer; font: inherit;
+  color: var(--text-primary, #1f2933);
+}
+a.board-tile:hover, button.board-tile:hover {
+  background: color-mix(in srgb, var(--text-primary, #1f2933) 7%, transparent);
+}
+.board-tile:focus-visible {
+  outline: 2px solid var(--primary, #667eea); outline-offset: 2px;
+}
+.board-tile.is-current {
+  border-color: var(--primary, #667eea);
+  background: color-mix(in srgb, var(--primary, #667eea) 12%, transparent);
+  cursor: default;
+}
+.board-tile-badge {
+  display: flex; align-items: center; justify-content: center;
+  width: 52px; height: 52px; border-radius: 14px;
+  font-size: 1.3rem; font-weight: 600;
+  background: color-mix(in srgb, var(--text-primary, #1f2933) 8%, transparent);
+  border: 1px solid var(--card-border, var(--glass-border, rgba(0, 0, 0, .12)));
+  color: var(--text-primary, #1f2933);
+}
+.board-tile-badge.is-small { width: 34px; height: 34px; font-size: .95rem; border-radius: 10px; }
+.board-tile.is-add .board-tile-badge {
+  background: none; border-style: dashed;
+  color: var(--text-secondary, var(--text-muted, #667));
+}
+.board-tile-label {
+  font-size: .82rem; text-align: center; line-height: 1.25;
+  max-width: 100%; overflow-wrap: anywhere;
+  color: var(--text-secondary, var(--text-muted, #667));
+}
+.board-tile.is-current .board-tile-label { color: var(--text-primary, #1f2933); }
+
+/* -- רשימת הניהול -- */
+.board-pin-hint {
+  margin: 0 0 .8rem; font-size: .85rem;
+  color: var(--text-secondary, var(--text-muted, #667));
+}
+.board-pin-row {
+  display: flex; align-items: center; gap: .7rem;
+  padding: .5rem .3rem; border-radius: 10px; cursor: pointer;
+}
+.board-pin-row:hover {
+  background: color-mix(in srgb, var(--text-primary, #1f2933) 6%, transparent);
+}
+.board-pin-name { flex: 1; overflow-wrap: anywhere; }
+.board-pin-row input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; }
+
+/* -- High Contrast: הערכה אינה מגדירה --card-* --
+   ``high-contrast.css`` מגדיר ``--glass-border: #ffffff`` אבל לא את
+   ``--card-bg``/``--card-border``/``--text-primary``. בלי הבלוק הזה
+   ה-fallback נותן כרטיס לבן עם גבול לבן — גבול בלתי נראה בדיוק בערכה
+   שכל תכליתה ניגודיות. זו אותה תבנית שכבר קיימת ב-bookmarks.css,
+   collections.css ו-global_search.css: הרכיב משלים לעצמו את מה שהערכה
+   לא סיפקה, ברמת Level 3. */
+:root[data-theme="high-contrast"] .board-modal .modal-content,
+:root[data-theme="high-contrast"] .board-tile-badge {
+  background: #000;
+  color: #fff;
+  border-color: #fff;
+}
+:root[data-theme="high-contrast"] .board-modal .modal-header {
+  border-bottom-color: #fff;
+}
+:root[data-theme="high-contrast"] .board-modal .modal-header h3,
+:root[data-theme="high-contrast"] .board-modal .modal-close,
+:root[data-theme="high-contrast"] .board-tile,
+:root[data-theme="high-contrast"] .board-tile-label,
+:root[data-theme="high-contrast"] .board-pin-hint {
+  color: #fff;
+}
+:root[data-theme="high-contrast"] .board-tile.is-current {
+  border-color: #ff0;
+  background: none;
+}
+:root[data-theme="high-contrast"] .board-tile.is-current .board-tile-label { color: #ff0; }

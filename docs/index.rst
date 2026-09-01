@@ -2,8 +2,7 @@
 
 Code Keeper Bot - תיעוד API
 ============================
-
-ברוכים הבאים לתיעוד ה-API של Code Keeper Bot!
+:summary: ברוכים הבאים לתיעוד ה-API של Code Keeper Bot!
 
 בוט זה מספק ממשק טלגרם מתקדם לניהול ושמירת קטעי קוד, עם תמיכה בשפות תכנות מרובות,
 אינטגרציה עם GitHub, וכלי ניהול מתקדמים.
@@ -22,6 +21,7 @@ Code Keeper Bot - תיעוד API
    versioning-stable-anchors
    whats-new
    architecture
+   dev/sticky_notes_extending
    contributing
    branch-protection-and-pr-rules
 
@@ -68,6 +68,7 @@ Code Keeper Bot - תיעוד API
    development/scripts
    development/i18n
    integrations
+   mcp-server
    repository-integrations
    security
    monitoring
@@ -118,13 +119,13 @@ Code Keeper Bot - תיעוד API
 
    webapp/overview
    webapp/code-browser
-   DEV_WEB_PUSH
    webapp/user-interfaces
    webapp/snippet-library
    webapp/onboarding
    webapp/caching
    webapp/advanced-caching
    webapp/cache-inspector
+   webapp/config-inspector
    webapp/static-checklist
    webapp/commands-catalog
    webapp/code-execution
@@ -142,6 +143,7 @@ Code Keeper Bot - תיעוד API
 
    webapp/theming_and_css
    webapp/custom_themes_guide
+   webapp/language-icons
 
 .. toctree::
    :maxdepth: 2

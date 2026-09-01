@@ -2,6 +2,11 @@
 
 {% block title %}{{ file.file_name }} - Markdown Preview{% endblock %}
 
+{% block extra_head %}
+{% set note_font_surface = 'md' %}
+{% include "_note_fonts_head.html" with context %}
+{% endblock %}
+
 {% block extra_css %}
 <style>
 /* אזור התצוגה והביצועים */
@@ -1295,6 +1300,15 @@ input.md-task-checkbox {
   opacity: 1;
 }
 
+/* יעד עוגן מפורש שנוצר מ-<a id="..."></a> שבמקור ה-Markdown (ראו js/md-anchors.js).
+   בלתי-נראה לחלוטין; scroll-margin-top מונע מהכותרת להיעצר מתחת לסרגל העליון. */
+#md-content .md-explicit-anchor {
+  display: block;
+  height: 0;
+  overflow: hidden;
+  scroll-margin-top: 80px;
+}
+
 /* ──── כפתור צף "העתק כמארקדאון" ──── */
 .md-copy-selection-fab {
   position: absolute;
@@ -1809,7 +1823,8 @@ input.md-task-checkbox {
 <div id="md-root">
   <div class="file-header" style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:1rem;">
     <div style="display:flex;align-items:center;gap:.75rem;min-width:0;">
-      <span style="font-size:2rem;">📝</span>
+      {# הדף הזה תמיד מציג Markdown, ולכן השפה קבועה ולא מגיעה מהקובץ #}
+      {{ lang_icon('markdown', LANG_ICON_SIZES.file_row) }}
       <div id="md-file-name-wrap">
         <h1 id="md-file-name">{{ file.file_name }}</h1>
         <div class="muted" style="margin-top:.25rem;">Markdown</div>
@@ -2101,6 +2116,7 @@ input.md-task-checkbox {
 </div>
 
 <script src="{{ url_for('static', filename='js/admonition-icons.js') }}"></script>
+<script src="{{ url_for('static', filename='js/md-anchors.js') }}?v={{ static_version }}"></script>
 <script src="{{ url_for('static', filename='js/utils/rtl-code.js') }}"></script>
 <script src="{{ url_for('static', filename='js/utils/safe-highlight.js') }}"></script>
 <script>
@@ -2587,9 +2603,16 @@ try { if (typeof window !== 'undefined') { window.attachColorSwatches = attachCo
       });
     })();
 
-    // רינדור ראשוני
+    // רינדור ראשוני.
+    // עוגני HTML מפורשים בכותרות (למשל `## סעיף <a id="x"></a>`) נשלפים לפני הרינדור
+    // ומוחלים אחריו כאלמנטי יעד — ה-renderer רץ עם html:false ולכן התגית עצמה לא שורדת.
+    // ראו webapp/static/js/md-anchors.js.
     const container = document.getElementById('md-content');
-    container.innerHTML = md.render(MD_TEXT || '');
+    if (window.MdAnchors) {
+      window.MdAnchors.renderWithAnchors(MD_TEXT || '', (src) => md.render(src), container);
+    } else {
+      container.innerHTML = md.render(MD_TEXT || '');
+    }
     attachColorSwatches(container);
     // בדיקת smoke מהירה: האם ::: tip מומר ל-admonition (לוג בלבד)
     try {
@@ -3256,7 +3279,14 @@ try { if (typeof window !== 'undefined') { window.attachColorSwatches = attachCo
       (function restoreScrollPosition(){
         const hash = window.location.hash;
         if (!hash) return;
-        const element = document.querySelector(hash);
+        // getElementById ולא querySelector: מזהה שמתחיל בספרה (כמו "1-תקשורת" מכותרת
+        // ממוספרת) או מזהה מקודד ב-% אינם סלקטור CSS חוקי — querySelector היה זורק.
+        let element = null;
+        try {
+          element = document.getElementById(decodeURIComponent(hash.slice(1)));
+        } catch (_) {
+          element = document.getElementById(hash.slice(1));
+        }
         if (!element) return;
         setTimeout(() => { try { element.scrollIntoView({ behavior: 'smooth', block: 'start' }); element.tabIndex = -1; element.focus(); } catch(_){} }, 100);
       })();
@@ -4632,8 +4662,9 @@ function goBackTwoSteps(ev){
   } catch(_) { }
 })();
 </script>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/sticky-notes.css') }}">
-<script src="{{ url_for('static', filename='js/sticky-notes.js') }}"></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/sticky-notes.css') }}?v={{ static_version }}">
+<script>window.STICKY_NOTE_MAX_CHARS = {{ max_note_chars | tojson }};</script>
+<script src="{{ url_for('static', filename='js/sticky-notes.js') }}?v={{ static_version }}"></script>
 <script>
   // אתחול פתקים דביקים רק לאחר שרינדור ה-Markdown הושלם (או fallback בטוח)
   (function(){

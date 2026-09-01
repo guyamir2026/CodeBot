@@ -1,7 +1,4 @@
-# Android & AI Style Rules
-
-> **מתי להשתמש:** בכל שינוי/PR – כללי סגנון ותשובות
-> **ראו גם:** Commit/PR
+# CodeKeeper forever 💫 Rules
 
 ---
 
@@ -12,6 +9,108 @@
 - **כתוב בשפה פשוטה** ומובנת לכולם, הימנע ממילים גבוהות
 - **שמור על טון עניו** – הסבר כאילו אתה מדבר עם חבר טוב
 - **כשיש כמה אפשרויות** – הצג קודם את הפתרון הפשוט והאמין ביותר
+
+---
+
+## תהליך עבודה
+
+1. **קודם מתכננים** – לפני כל מימוש, יש להציג תוכנית עבודה ברורה (עם הסברים בשפה פשוטה ומובנת לכל)
+2. **אחר כך מממשים** – המימוש מתחיל רק לאחר אישור התוכנית.
+3. **אין רשות לדלג** בשלב המימוש על חלקים כלשהם מתוך תוכניות מימוש שנמסרות לך, יש לממש את כל מה שבתכניות/מסמכי מימוש.
+
+## כלל חשוב: 
+
+אם נמצאו באגים כלשהם בריפו - תמיד נחפש פיתרונות שורשיים לבעיה, ולא פיתרונות "טלאי".
+
+---
+
+> [!IMPORTANT]
+> ******חובה****** לעקוב ולמלא אחר ההוראות של `דפוסי באגים` באופן מלא, בעקביות, אין חשיבות לקידוד מהיר - רק לקידוד אחראי - בלי השערות באף חלק מהקידוד
+> ## דפוסי באגים — amir-bug-patterns 
+
+> **מתי להשתמש:** לפני נגיעה באחד הנושאים בטבלה, ובכל פעם שריוויוור תופס דפוס
+> **ראו גם:** כלל הפתרון השורשי, CI / Required Checks
+
+הריפו `amirbiron/amir-bug-patterns` מרכז דפוסי באגים שכבר עלו לי בפרודקשן — לא תיאוריה. הוא ממורר ב-CodeKeeper, אז קוראים אותו כך:
+
+```text
+codekeeper_get_repo_file(repo="amir-bug-patterns", path="CRITICAL-PATTERNS.md")
+codekeeper_search_repo(repo="amir-bug-patterns", query="<מונח>")
+```
+
+אם ה-MCP לא זמין בסשן: הריפו ציבורי, אז אפשר לצרף אותו לסשן (`add_repo` ואז clone) או לקרוא ממנו ישירות. אין צורך בהרשאות מיוחדות.
+
+### מתי לקרוא מה
+
+| כשאתה נוגע ב... | קרא |
+|---|---|
+| שמירה/מחיקה שמסתיימת בהודעת ✅ למשתמש | `CRITICAL-PATTERNS.md` K11 |
+| קאש / invalidation | `bugbot-rules/return-value-failure-unchecked.md` §4 |
+| דגל שמצהיר "מטא-דאטה בלבד" (`npm install --package-lock-only`, `django-admin migrate --fake`), או רשומה שמתעדכנת בנפרד מהעבודה שהיא מתארת | `bugbot-rules/state-record-without-state-change.md` |
+| callbacks / handlers מקביליים, מזהים מבוססי־זמן | `CORE-PATTERNS.md` U1 |
+| PyGithub / קריאות SDK חיצוני | `BY-STACK/external-sdk.md` |
+| קבצי `docs/**/*.rst` | `bugbot-rules/line-number-coupling.md` |
+| טסטים עם סטאבים ידניים | `TESTING-PATTERNS.md` + `bugbot-rules/widened-exception-scope.md` |
+| הרכבת URL/מחרוזת שמכילה סוד, הודעות חריגה, ניקוי לוגים/Sentry | `CRITICAL-PATTERNS.md` K13 + `bugbot-rules/secret-in-derived-text.md` |
+| מפתח/טוקן שמועבר כפרמטר URL (`params={"key": ...}`), או שינוי ברשימת דפוסי הניקוי | `CRITICAL-PATTERNS.md` K14 + `bugbot-rules/secret-in-url-query.md` |
+| מסיר שורת לוג, או עוטף אותה ב-guard שמונע הערכת ארגומנטים (הטריגר הנפוץ: תיקון PII) | `bugbot-rules/side-effect-riding-on-log-line.md` |
+
+### תמיד, בלי קשר לטבלה
+
+- **לפני עטיפת קריאה ב-`try/except`** → `CRITICAL-PATTERNS.md` K11. בקצרה: בדוק מה הפונקציה מחזירה בכשל. אם היא מחזירה `None`/`False`/`0` ולא זורקת, ה-`except` לא ירוץ לעולם — צריך `if not result:` לפני כל דיווח הצלחה.
+הדפוס הזה כבר עלה בריפו הזה **שלוש פעמים** (`save_backup_bytes` ב-PR #3232 ב-#3172, ו-`delete_pattern` של הקאש).
+- **לפני כתיבת טסט חדש** → `claude-md-snippets/testing.md`. בפרט: טסט שנוסח עם תיקון חייב להיכשל בלי התיקון — הרץ אותו על הקוד הישן וּודא שהוא נופל.
+- **אחרי שטסט נופל על חריגה** → `bugbot-rules/widened-exception-scope.md`. אל תרחיב `except` כדי לעבור; בדוק קודם את הסטאב/fixture — שם השורש בדרך כלל.
+
+### סגירת הלולאה (חובה, לא רשות)
+
+1. **ריוויוור (cubic/qodo/CodeRabbit/claude) תפס דפוס אמיתי** שאינו ב-amir-bug-patterns → פתח שם PR שמוסיף אותו (מסמך מקור + הצלבה לפי ה-README שלו), **וגם** הוסף שורת טריגר לטבלה כאן.
+2. **זיהית דפוס חוזר בעצמך** (תיקנת פעמיים את אותו סוג טעות) → אותו תהליך.
+3. דפוס בלי שורת טריגר = דפוס שלא ייקרא בזמן המימוש. שני הצעדים הם צעד אחד.
+
+התהליך המלא והמיפוי לשאר הפרויקטים: `INTEGRATION.md` באותו ריפו.
+
+---
+---
+
+## אתר התיעוד — מתי לעיין
+
+> **מתי להשתמש:** בכל פעם שאתה עומד להשלים פער מידע מניחוש במקום ממה שמול העיניים
+
+נקודת הכניסה למסמכי התיעוד היא: `AI-MAP.md` בשורש הריפו — בקובץ: שורה ותקציר לכל עמוד ידני. 
+
+### המבחן — שאלה אחת, על עצמך
+אתה עומד לכתוב או לקבוע משהו: שם, ערך, מבנה, הנחה על התנהגות של חלק אחר במערכת, בחירה בין גישות  -----  ✋ עצור ושאל: **האם זה נגזר כולו ממה שמול העיניים שלי עכשיו** — הקובץ שאני עורך, הדיף, וההוראה שקיבלתי? אם כן — כתוב, בלי עיון. 
+אם לא — אתה משלים פער מהזיכרון או מניחוש, ולפי מקום ההגדרה של מה שאתה עומד לקבוע:
+
+| איפה גרה ההגדרה? | הפעולה |
+|---|---|
+| בקוד הריפו (חתימה, שם שדה, ערך קיים) | קרא את הקוד — grep, לא תיעוד |
+| מחוץ לריפו (SDK, HTTP API, פרוטוקול, דגל CLI) | סקיל `source-driven-development` |
+| בריפו אבל לא בקוד שמולך — כוונה, מוסכמה, חוזה בין רכיבים, שם שאולי כבר קיים, "למה זה בנוי ככה" | קרא את `AI-MAP.md` ← פתח עמודים שנראים תואמים לקייס שלך |
+
+### קיצורי דרך (מופעים נפוצים של המבחן — לא רשימה סגורה)
+- ממציא שם חדש (אירוע, קוד שגיאה, שדה לוג, מטריקה, ENV) ← `events_catalog`, `error_codes`, `environment-variables`
+- מניח מה רכיב אחר עושה (בוט ← שירות ← DB ← ווב) ← `architecture`, `document-flow`, `conversation-handlers`
+- שאילתת Mongo שמחזירה רשימה ← `database/indexing`, `cursor-pagination`, `performance-bible`
+- ⚠️ כותב או עורך עמוד תחת `docs/` ← `doc-authoring` **לפני** הכתיבה, לא אחרי. RTD רץ עם `fail_on_warning: true`, אז חריגה מהמוסכמות מפילה בילד ולא רק נראית שונה. בעריכת עמוד קיים גם `versioning-stable-anchors` — אילו עוגנים אסור לשבור
+- ממציא מונח או שם בעברית שכבר קיים במקום אחר בתיעוד ← `style-glossary`
+- ⚠️ כותב טסט והטסט צריך לבודד משהו חיצוני — קבצים, טלגרם, HTTP, מונגו, קוד אסינכרוני ← `testing`
+- כותב או משנה CSS בוובאפ — צבע, מודאל, כרטיס, מצב hover, ערכת נושא ←  `theming_and_css` חובה ⚠️⚠️
+- ההתנהגות בקוד נראית שגויה או מפתיעה ← העמוד מתעד כוונה; סתירה בין קוד לתיעוד היא ממצא לדיווח, לא לתיקון שקט
+
+### מקרה מיוחד: תוכנית מימוש
+
+> ⚠️ לפני תוכנית מימוש עיין ב`AI-MAP.md`
+> 
+כשאתה כותב תוכנית מימוש לפיצ'ר — המבחן נדלק כמעט בכל שורה: גישה, מבנה, נקודות השקה עם מה שכבר מומש. במקום להפעיל אותו נקודה-נקודה, **קרא את `AI-MAP.md` פעם אחת בתחילת התכנון** ופתח את עמודי התשתיות שהפיצ'ר צפוי לגעת בהן — פיצ'ר חדש כמעט תמיד נשען על משהו שכבר מומש בפרויקט, וכנראה יש עליו עמוד. שם גרה הכוונה — למה זה בנוי ככה, מה החוזה בין הרכיבים.
+
+הנחה שגויה בתוכנית יקרה פי כמה מהנחה שגויה בקוד: היא משתכפלת לכל שלבי המימוש. בתוכנית עצמה ציין ליד כל נקודת השקה את העמוד שהיא נשענת עליו — או שבדקת ואין עמוד.
+
+### סמכות התיעוד
+- התיעוד הוא **התמצאות, לא סמכות**. כל טענה עובדתית בו — התנהגות, נתיב, פרמטר, "נתמך" — קודם תאמת מול הקוד לפני שתסתמך עליה. 
+- התיעוד אינו תנ"ך - ייתכן שאינו מעודכן! אמת מול הקוד! 
+- שני חריגים: בלוקי `literalinclude` ועמודי autodoc, שנמשכים מהמקור בזמן הבנייה. סתירה בין פרוזה לקוד ← הקוד צודק, והסתירה ממצא לדיווח.
 
 ---
 
@@ -54,7 +153,7 @@ import shutil
 def safe_rmtree(path: Path, allow_under: Path) -> None:
     p = path.resolve()
     base = allow_under.resolve()
-    if not str(p).startswith(str(base)) or p in (Path('/'), base.parent, Path.cwd()):
+    if not (p == base or base in p.parents) or p in (Path('/'), base.parent, Path.cwd()):
         raise RuntimeError(f"Refusing to delete unsafe path: {p}")
     shutil.rmtree(p)
 ```
@@ -84,17 +183,6 @@ rg -n "(shutil.rmtree|os.remove|Path.unlink|rm -rf|rimraf)" -S
 - **אל תבצע** merge/PR כדי לא לדרוס היסטוריה
 - בצע `git restore`/`git checkout` לקבצים או `git revert` לקומיטים
 - אם אין היסטוריה מקומית: שחזר מ-CI artifacts/ענף גיבוי/מכונה אחרת
-
----
-
-## קישור לתיעוד והקשר
-
-> **מתי להשתמש:** בכל PR/מסמך – מדיניות וקישורים רלוונטיים
-
-- קרא והסתמך על התיעוד: [CodeBot – Project Docs](https://amirbiron.github.io/CodeBot/)
-- קובץ זה הוא מדיניות מחייבת לצוות; יש להפנות אליו ב-PRs ובתיעוד
-- ⚠️ **לפני כל תיקון טסטים פתח את [CodeBot Docs](https://amirbiron.github.io/CodeBot/) וקרא את הנחיות הטסטים הרלוונטיות (async, aiohttp, cleanup וכו') לפני ביצוע שינוי**
-
 ---
 
 ## ChatOps – מודעות ושילוב
@@ -116,103 +204,6 @@ rg -n "(shutil.rmtree|os.remove|Path.unlink|rm -rf|rimraf)" -S
     **אל תסיק מתוך הקוד** – התייעץ עם המשתמש ובקש ממנו להריץ את הפקודה המתאימה בבוט ושתף את הפלט.
     המידע שיחזור מהבוט נחשב למקור האמת.
 ```
-
----
-
-## כללי שימוש ב-AI/CodeBot
-
-> **מתי להשתמש:** בכל שימוש ב-AI/אוטומציה בקוד וב-PRים
-
-- כל שינוי שמוצע על ידי AI עובר code review אנושי לפני merge
-- **אין להזין** סודות, מפתחות או PII לפרומפטים או קבצי הקשר
-- פקודות שמורצות אוטומטית: ללא `sudo`, לא אינטראקטיביות, ורק בתיקיות tmp
-- תעד ב-PR החלטות אוטומציה: מקור ההצעה, שיקולים ובדיקות שבוצעו
-
----
-
-## Android/Kotlin/Compose
-
-> **מתי להשתמש:** בפיתוח Android/Kotlin/Compose – סגנון, ארכיטקטורה וטסטים
-> **ראו גם:** CI / Required Checks
-
-### Kotlin
-- העדף `val` על `var`, אי-שינוי, `data`/`sealed` classes
-- Null-safety ברורה
-
-### Concurrency
-- Coroutines עם Structured Concurrency
-- שימוש ב-`viewModelScope`/`CoroutineScope` נכון
-
-### זרימות נתונים
-- העדף `Flow`
-- מיפוי ב-Repository
-- Dispatchers מתאימים (IO/Default)
-
-### ארכיטקטורה
-- MVVM
-- Single Source of Truth
-- Repository/UseCases
-- DI עם Hilt
-
-### Compose
-- State hoisting
-- `remember`/`derivedStateOf`
-- הימנע מ-side effects בתוך Composables
-- שימוש ב-`LaunchedEffect`/`DisposableEffect`
-- בדיקות עם compose-ui-test
-
----
-
-## Commit/PR
-
-> **מתי להשתמש:** כשכותבים קומיטים או פותחים Pull Request
-> **ראו גם:** CI / Required Checks, קישור לתיעוד והקשר
-
-### שמות ענפים
-`fix/...`, `chore/...`, `feat/...`
-
-### Conventional Commits
-`feat`/`fix`/`chore`/`docs`/`refactor`/`test`/`build`
-
-### תיאור PR
-- תיאור קצר ב-HTML: What / Why / Tests
-- כולל לינק ל-RTD build/preview אם יש
-- מלא PR לפי התבנית שב-`.github/pull_request_template.md`
-- צרף Docs Preview, בדיקות, צ'קליסט ו-Rollback
-- **ציין מפורשות** האם עיינת ב-[CodeBot – Project Docs](https://amirbiron.github.io/CodeBot/)
-
-### לפני merge
-- תיאור ברור
-- תוכנית בדיקות
-- סיכוני Rollback
-- עדכון docs
-
-### UI
-צרף צילום/וידאו תוצאות אם רלוונטי
-
-**הערה:** טבלת דוגמאות ל-Conventional Commits והצ'קליסט לפני merge נשמרים בתבנית ה-PR
-
----
-
-## CI / Required Checks
-
-> **מתי להשתמש:** לפני merge ובבדיקת סטטוסי CI
-> **ראו גם:** הימנעות ממחיקות קבצים בטסטים ובסקריפטים
-
-### חובות
-- מעבר ירוק: `./gradlew test detekt ktlintCheck`
-- **אין להריץ** `git clean`/`reset` על ה-workspace
-- עבודה רק על תיקיות זמניות
-- טסטים שנוגעים לקבצים ירוצו בסביבה מבודדת לכל טסט
-
-### סטטוסים נדרשים ב-PR
-- "🔍 Code Quality & Security"
-- "Unit Tests (3.11)"
-- "Unit Tests (3.12)"
-
-### נוספים
-- אין `paths-ignore` על `.cursorrules` – שינוי בו מריץ CI
-- שמור דיווח סטטוסים גם בגרסת legacy/plain אם נדרש למדיניות
 
 ---
 
@@ -253,23 +244,6 @@ safe_rmrf() {
 }
 ```
 
----
-
-## Sphinx/RTD (תיעוד)
-
-> **מתי להשתמש:** בעת בנייה/עדכון תיעוד Sphinx/RTD
-
-### כללים
-- **אין להריץ** קוד בטופ-לבל בזמן build (importים חייבים להיות בטוחים)
-- RTD נחשב נכשל על אזהרות (`fail_on_warning: true`) – שמור 0 warnings
-- השתמש ב-`:noindex:` בעמודי סקירה חופפים: api, database, handlers, services, configuration
-
-### הגדרות
-- `autodoc_mock_imports`: cairosvg, aiohttp, textstat, langdetect, pytest, search_engine, code_processor, integrations
-- `docs/examples.rst` מוחרג עד שהעמוד יתווסף ל-toctree (ואז הסר מה-exclude)
-
----
-
 ## Telegram Bot – מניעת "Message is not modified"
 
 > **מתי להשתמש:** בפיתוח/תחזוקת בוט Telegram בעת עריכת הודעות
@@ -300,29 +274,6 @@ async def safe_edit(query, text, reply_markup=None, parse_mode=None):
 
 ---
 
-## GitHub – "📥 הורד קובץ מריפו"
-
-> **מתי להשתמש:** בפלואו הורדת קבצים מהריפו – התנהגות UI בטוחה
-
-### כללים
-- בכניסה לפלואו: `browse_action=download`, אפס `multi_mode`/`safe_delete`
-- במצב הורדה **לא מציגים** כפתורי מחיקה או מצב מחיקה
-- חזרה לתפריט בלבד מחזירה את המצב לעריכה/מחיקה (אם נדרש)
-
----
-
-## Gists/קישורים חיצוניים בהנחיות משתמש
-
-> **מתי להשתמש:** כשהמשתמש מצרף Gist/קישור בבקשה הנדסית
-
-### כללים
-- בכל פעם שהמשתמש מצרף Gist/קישור קוד: **עיין בתוכן** לפני מימוש
-- יישם בהתאם לרוח ההצעה
-- מותר לסטות בפרטים אם יש שיקולי אבטחה/פשטות, **אבל ציין זאת**
-- אם יש פער: הצע התאמה או שאל במידת הצורך
-
----
-
 ## Performance & Optimization Architecture
 
 > **מתי להשתמש:** בכל פיתוח של Endpoint חדש, שאילתת DB, או דף ב־Webapp
@@ -330,33 +281,59 @@ async def safe_edit(query, text, reply_markup=None, parse_mode=None):
 ### 1. חוק ה־Smart Projection (החרגת שדות כבדים)
 
 - **לעולם אל תמשוך** את השדות `code`, `content`, או `raw_data` בשאילתות שמחזירות רשימה/אוסף של קבצים.
-
 - השתמש תמיד בקבוע `HEAVY_FIELDS_EXCLUDE_PROJECTION` (מתוך `database/repository.py`).
-
 - משיכת תוכן מלא תתבצע **רק** בבקשה מפורשת (Explicit Fetch) עבור צפייה או עריכה של קובץ בודד.
 
 ### 2. מטא־דאטה במקום חישובים בזיכרון
 
 - העדף שימוש בשדות מחושבים ב־DB כמו `file_size` ו־`lines_count`.
-
 - אם הוספת שדה תוכן חדש, ודא שהוא מתעדכן ב־`save_code_snippet` כך שלא נצטרך לספור שורות או בייטים בפייתון בזמן שליפת רשימות.
 
 ### 3. אופטימיזציית חיפוש (The Snippet Pattern)
 
 - בחיפוש קוד, **אל תחזיר את כל הקובץ** מה־API.
-
 - השתמש ב־Aggregation של MongoDB (`$regexFind`) כדי לחתוך רק את קטע הקוד הרלוונטי (Snippet) כבר ברמת בסיס הנתונים.
 
 ### 4. אינדקסים כחלק מהפיתוח
 
 - כל שאילתה חדשה חייבת לעבור בדיקת אינדקסים ב־`database/repository.py`.
-
 - העדף אינדקסים מורכבים (Compound Indexes) הכוללים את ה־`user_id` יחד עם סטטוס המחיקה/מועדפים.
 
 ### 5. טעינה אסינכרונית ב־Webapp (Lazy Loading)
 
 - דפים כבדים ב־Webapp צריכים להחזיר HTML ראשוני מהר (< 200ms).
-
 - השתמש ב־**Skeleton Loaders** ובשליפת נתונים מה־API דרך JavaScript ברקע.
-
 - עטוף חישובים כבדים ב־`await asyncio.to_thread(...)` כדי לא לחסום את ה־Event Loop.
+
+---
+
+## פתיחת PR
+  
+- מלא PR לפי התבנית שב-`.github/pull_request_template.md`
+- ציין מפורשות האם עיינת ב-CodeBot – Project Docs ובאילו קבצים.
+  ---
+  
+
+## עדכון בטלגרם — לפי בקשה
+
+כשהמשתמש מבקש בתחילת משימה "עדכן אותי בטלגרם" / "תשלח לי בטלגרם כשתסיים"
+(או ניסוח דומה) — בסיום המשימה שלח הודעת סיכום קצרה בעברית דרך Telegram Bot API:
+
+- שולחים עם `curl` ל-`sendMessage`, דרך משתני הסביבה
+  `TELEGRAM_BOT_TOKEN` ו-`TELEGRAM_CHAT_ID`.
+- מעבירים את הטקסט עם `--data-urlencode "text=..."` (מטפל נכון בעברית ובתווים מיוחדים).
+- כותבים את גוף ההודעה לקובץ ב-scratchpad ואז `text=$(cat file)` —
+  כדי לא להתעסק עם escaping של shell על טקסט רב-שורתי.
+- **degradation:** אם אחד המשתנים חסר — אל תיכשל ואל תעצור את המשימה;
+  דווח בצ'אט "לא נשלח לטלגרם (משתנה X חסר)" והמשך כרגיל.
+
+### עיצוב (אופציונלי)
+כברירת מחדל שלח **בלי** `parse_mode` — טקסט גולמי, בטוח לכל תו.
+רק אם צריך מודגש/נטוי/קישור לחיץ הוסף `--data-urlencode "parse_mode=HTML"`,
+ואז — לפי כלל 6 — **חובה** `html.escape` על כל תוכן שמגיע ממקור חיצוני
+(DB/API/פלט כלים), אחרת `< > &` ישברו את ההודעה.
+
+---
+
+Team CodeKeeper forever 💫 
+We love Claude 💌

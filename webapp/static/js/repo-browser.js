@@ -132,7 +132,7 @@ function updateMarkdownToggleVisibility(path, language) {
 /**
  * מפעיל תצוגת Markdown
  */
-async function enableMarkdownPreview() {
+async function enableMarkdownPreview(seq) {
     const editorWrapper = document.getElementById('code-editor-wrapper');
     const previewContainer = document.getElementById('markdown-preview-container');
     const toggleBtn = document.getElementById('markdown-preview-toggle');
@@ -148,7 +148,9 @@ async function enableMarkdownPreview() {
     toggleBtn?.classList.add('active');
 
     // רינדור התוכן
-    await renderMarkdownPreview(state.currentFileContent);
+    await renderMarkdownPreview(state.currentFileContent, seq);
+
+    emitRepoViewChanged();
 }
 
 /**
@@ -174,6 +176,8 @@ function disableMarkdownPreview() {
             state.editor.refresh();
         }
     }, 100);
+
+    emitRepoViewChanged();
 }
 
 /**
@@ -226,7 +230,7 @@ async function ensureCodeViewerInitialized() {
 /**
  * רינדור תוכן Markdown
  */
-async function renderMarkdownPreview(content) {
+async function renderMarkdownPreview(content, seq) {
     const previewContent = document.getElementById('markdown-preview-content');
     if (!previewContent || content === null || content === undefined) return;
 
@@ -248,16 +252,26 @@ async function renderMarkdownPreview(content) {
         }
 
         if (typeof MarkdownLiveRenderer !== 'undefined' && MarkdownLiveRenderer.isSupported()) {
-            // רינדור ה-Markdown ל-HTML
-            const html = await MarkdownLiveRenderer.render(content);
-            previewContent.innerHTML = html;
+            // רינדור ה-Markdown ל-HTML (כולל שליפת עוגני HTML מפורשים מהכותרות —
+            // ה-renderer רץ עם html:false, ראו webapp/static/js/md-anchors.js)
+            const rendered = await MarkdownLiveRenderer.renderWithAnchors(content);
+            // אותו נימוק כמו ב-``initCodeViewer``: הרינדור ארוך, ובזמנו
+            // בחירה חדשה יכולה להסתיים. כתיבה כאן הייתה דורסת אותה.
+            if (!selectionIsCurrent(seq)) return;
+            previewContent.innerHTML = rendered.html;
 
-            // שיפורים: syntax highlighting, math, mermaid
+            // שיפורים: syntax highlighting, math, mermaid + החלת העוגנים המפורשים
             try {
-                await MarkdownLiveRenderer.enhance(previewContent);
+                await MarkdownLiveRenderer.enhance(previewContent, rendered.anchors);
             } catch (err) {
                 console.warn('Markdown enhancements failed', err);
             }
+            // ``enhance`` הוא ההמתנה האחרונה כאן, ואחריה עוד שתי פעולות
+            // שמעטרות את **אותו** אלמנט תצוגה. בחירה חדשה שהסתיימה בזמנה
+            // כבר החליפה את התוכן, והעיטור היה חל על ה-DOM שלה עם הנתונים
+            // של הקובץ הישן. (נמצא בביקורת שיטתית של כל ההמתנות במסלול,
+            // לא בדיווח — אותה מחלקה בדיוק.)
+            if (!selectionIsCurrent(seq)) return;
             applySyntaxHighlighting(previewContent);
             // הוספת גלילה חלקה לאנקורים בתפריט התוכן
             setupMarkdownAnchorScrolling(previewContent);
@@ -266,6 +280,13 @@ async function renderMarkdownPreview(content) {
     } catch (error) {
         console.warn('MarkdownLiveRenderer failed, falling back', error);
     }
+
+    // **גם ה-fallback הוא כתיבה לתצוגה המשותפת.** הוא נקרא אחרי שלוש
+    // המתנות (טעינת תלויות, highlight.js, הרינדור עצמו), ולכן בחירה חדשה
+    // כבר יכולה להיות מוצגת. כתיבה כאן — בין אם ה-HTML הישן ובין אם הודעת
+    // שגיאה — הייתה דורסת אותה. אין ``await`` בין הבדיקה לשתי הכתיבות,
+    // ולכן בדיקה אחת כאן מכסה את שתיהן.
+    if (!selectionIsCurrent(seq)) return;
 
     try {
         // Fallback: רינדור בסיסי עם markdown-it
@@ -645,14 +666,17 @@ function renderRepoSelector(repos, currentRepoName) {
 }
 
 /**
- * מחליף לריפו אחר
+ * שומר את בחירת הריפו בשני המקומות הסמכותיים: ``localStorage`` (שמשרת גם
+ * משתמש לא מחובר) וה-session בשרת.
+ *
+ * **חולץ מ-``switchRepo`` כדי שיהיה כותב אחד ולא שניים.** יש מסלול שני
+ * שצריך לשמור בלי להחליף ריפו: כשקישור תזכורת מגיע עם ``?repo=``, השרת
+ * כבר רינדר את הריפו הזה, ולכן ``switchRepo`` יוצא מיד בשורה הראשונה
+ * ולא שומר דבר. עד שה-``?repo=`` נשאר ב-URL זה לא הורגש — הפרמטר החזיק
+ * את הבחירה בעצמו. מרגע שהוא מנוקה, השמירה חייבת לקרות במפורש.
  */
-async function switchRepo(repoName) {
-    if (!repoName || repoName === currentRepo) return;
-
-    // שמירה ב-localStorage
+async function persistSelectedRepo(repoName) {
     localStorage.setItem('selectedRepo', repoName);
-    currentRepo = repoName;
 
     // שמירה בשרת (למשתמש מחובר)
     try {
@@ -665,6 +689,27 @@ async function switchRepo(repoName) {
         // לא קריטי - localStorage מספיק
         console.warn('Could not save repo selection to server:', e);
     }
+}
+
+/**
+ * מחליף לריפו אחר
+ */
+async function switchRepo(repoName) {
+    if (!repoName || repoName === currentRepo) return;
+
+    // **הקידום מיידי, ולא רק ב-``showWelcomeScreen`` שבסוף.** בין כאן
+    // לשם יש שני ``await`` (טעינת העץ וסוגי הקבצים), ובחלון הזה טעינת
+    // קובץ מהריפו הקודם עדיין באוויר — היא הייתה מתחייבת על תוכן של ריפו
+    // שכבר אינו מוצג.
+    fileSelectionSeq += 1;
+
+    // **הקידום סינכרוני, לפני ההמתנה לשמירה.** ``persistSelectedRepo``
+    // כוללת POST, ואם ``currentRepo`` היה מתעדכן רק אחריו — כל מי שקורא
+    // אותו בחלון הזה מקבל את הריפו הישן: ``getRepoParam`` בונה ממנו כל
+    // קריאת API, והשער בראש הפונקציה הזו משווה מולו, כלומר קריאה שנייה
+    // לא הייתה נחסמת ונוצרת החלפה כפולה.
+    currentRepo = repoName;
+    await persistSelectedRepo(repoName);
 
     // עדכון UI
     updateRepoDisplay(repoName);
@@ -707,11 +752,63 @@ function updateRepoDisplay(repoName) {
         item.classList.toggle('active', item.dataset.repo === repoName);
     });
 
+    // עדכון המונים — חלק מאותה פעולה לוגית, ולכן באותו מקום
+    renderRepoStats(repoName);
+
     // עדכון אלמנט נסתר עבור repo-history
     const currentRepoEl = document.getElementById('current-repo-name');
     if (currentRepoEl) {
         currentRepoEl.dataset.repo = repoName;
     }
+}
+
+/** שם הריפו כפי שהתבנית הדפיסה אותו ל-``#current-repo-name[data-repo]``. */
+function repoNameFromDom() {
+    const holder = document.getElementById('current-repo-name');
+    return holder ? (holder.dataset.repo || '') : '';
+}
+
+/**
+ * מודיע שהקובץ המוצג התחלף (או שאין קובץ).
+ *
+ * ``path === null`` פירושו "אין קובץ" — מסך הפתיחה. המאזין משתמש בזה כדי
+ * לפרק את הפתקים, ולא נשאר עם פתקים של קובץ שכבר לא על המסך.
+ *
+ * ``repo`` נקרא מ-``#current-repo-name[data-repo]``, שהתבנית כבר מדפיסה —
+ * ולא מ-``state``, שהוא פנימי לקובץ הזה.
+ *
+ * **הקורא רשאי להעביר ``repo`` מפורש, ואז הוא גובר.** טעינת קובץ היא
+ * אסינכרונית, ו-``updateRepoDisplay`` יכול להחליף את ``data-repo`` בזמן
+ * שהיא באוויר — ואז קריאה מה-DOM בסוף הטעינה הייתה מצמידה את הקובץ הישן
+ * לריפו החדש. מי שמתחיל טעינה מצלם את הריפו בהתחלה ומעביר את הצילום.
+ */
+/**
+ * מודיע שתצוגת הקובץ התחלפה בין קוד ל-Markdown.
+ *
+ * **נפלט מנקודת שינוי המצב עצמה** — ``enableMarkdownPreview`` /
+ * ``disableMarkdownPreview`` — ולא מאתרי ההפעלה. גם הכפתור וגם
+ * ``Ctrl+Shift+M`` עוברים דרכן, וכך גם כל קורא עתידי; פליטה מהמתג היתה
+ * מנייה של אתרים שמישהו ישכח לעדכן.
+ *
+ * מי שמאזין (``repo-notes``) צריך את זה כי **הגולל מתחלף**: הפתקים
+ * הנעוצים ממוקמים לפי גלילת הפאנל הפעיל, והחלפה בלי הודעה משאירה אותם
+ * על ההיסט של הפאנל הקודם עד הגלילה הבאה.
+ */
+function emitRepoViewChanged() {
+    try {
+        document.dispatchEvent(new CustomEvent('repo:view-changed', {
+            detail: { markdown: !!state.markdownPreviewEnabled }
+        }));
+    } catch (_) { /* אירוע שלא נשלח לא אמור להפיל את התצוגה */ }
+}
+
+function emitRepoFileEvent(path, repo) {
+    try {
+        const name = (repo === undefined || repo === null) ? repoNameFromDom() : repo;
+        document.dispatchEvent(new CustomEvent('repo:file-loaded', {
+            detail: { repo: name, path: path || null }
+        }));
+    } catch (_) { /* אירוע שלא נשלח לא אמור להפיל טעינת קובץ */ }
 }
 
 /**
@@ -739,6 +836,10 @@ function showWelcomeScreen() {
     state.currentFileContent = null;
     state.currentFileLanguage = null;
     state.editorFilePath = null;
+    // מסך הפתיחה הוא בחירה בפני עצמה — "אין קובץ". בלי הקידום, טעינה
+    // שעדיין באוויר הייתה מתייצבת אחריו ומרכיבה פתקים מעל מסך הפתיחה.
+    fileSelectionSeq += 1;
+    emitRepoFileEvent(null);
 }
 
 /**
@@ -776,6 +877,45 @@ function getRepoDefaultBranch(repoName) {
     const branch = meta && meta.default_branch ? String(meta.default_branch).trim() : '';
     return branch || 'main';
 }
+
+function getRepoTotalFiles(repoName) {
+    const meta = repoMetadataByName[repoName];
+    const total = meta ? meta.total_files : undefined;
+    // בלי בדיקת הטיפוס: Number(null) ו-Number(false) ו-Number('') כולם 0,
+    // ו-Number.isFinite מאשר אותם — ריפו שסונכרן חלקית היה מציג "0 files".
+    return typeof total === 'number' && Number.isFinite(total) ? total : null;
+}
+
+/**
+ * ממלא את מוני הריפו לפי הסימון ``data-repo-stat`` שבתבנית.
+ *
+ * זו נקודת העדכון היחידה של המונים אחרי שהדף נטען. עד כה הם רונדרו
+ * בשרת פעם אחת ואיש לא נגע בהם בהחלפת ריפו, ולכן הם נשארו תקועים על
+ * הערכים של הריפו הראשון.
+ *
+ * מונה חדש דורש שתי פעולות: סימון ``data-repo-stat`` בתבנית, ומיפוי
+ * מתאים ב-``values`` כאן. בלי המיפוי הוא יוצג כ-``—``, ובדיקת
+ * ``test_every_marked_stat_is_filled_by_the_renderer`` תיכשל.
+ *
+ * הערכים נלקחים מ-``repoMetadataByName`` שכבר יושב בזיכרון, ולכן
+ * העדכון סינכרוני — אין ``await`` ואין סיכון שתגובה ישנה תדרוס חדשה.
+ *
+ * כשאין בכלל מטא-דאטה לריפו — למשל אם ``/api/repos`` לא הספיק לחזור —
+ * הפונקציה לא נוגעת בכלום, כדי לא למחוק ערך תקין שהשרת כבר רינדר.
+ * לעומת זאת מטא-דאטה שקיים אבל חסר בו השדה מוצג כ-``—``, כי שם הערך
+ * הישן באמת שייך לריפו אחר.
+ */
+function renderRepoStats(repoName) {
+    if (!repoMetadataByName[repoName]) {
+        return;
+    }
+    const values = { total_files: getRepoTotalFiles(repoName) };
+    document.querySelectorAll('[data-repo-stat]').forEach(el => {
+        const value = values[el.dataset.repoStat];
+        el.textContent = (value === null || value === undefined) ? '—' : String(value);
+    });
+}
+
 // ========================================
 // Initialization
 // ========================================
@@ -840,13 +980,19 @@ async function applyInitialNavigationFromUrl() {
 
         // בדיקה אם יש פרמטר repo ב-URL
         const targetRepo = (repoFromQuery || repoFromHash || '').trim();
-        if (targetRepo && targetRepo !== currentRepo) {
+        if (targetRepo) {
             // וידוא שהריפו קיים ברשימת הריפויים הזמינים
-            if (repoMetadataByName && repoMetadataByName[targetRepo]) {
-                // החלף ריפו לפני פתיחת הקובץ
+            if (!(repoMetadataByName && repoMetadataByName[targetRepo])) {
+                console.warn(`Repo "${targetRepo}" not found in available repos, staying with "${currentRepo}"`);
+            } else if (targetRepo !== currentRepo) {
+                // החלף ריפו לפני פתיחת הקובץ. ``switchRepo`` שומר בעצמו.
                 await switchRepo(targetRepo);
             } else {
-                console.warn(`Repo "${targetRepo}" not found in available repos, staying with "${currentRepo}"`);
+                // **השרת כבר רינדר את הריפו הזה**, ולכן ``switchRepo`` היה
+                // יוצא מיד בלי לשמור. בלי השמירה כאן, ניקוי הפרמטר בהמשך
+                // היה מוחק את הכוונה בלי שאיש קלט אותה — והריענון הבא היה
+                // נוחת על ריפו ברירת המחדל.
+                await persistSelectedRepo(targetRepo);
             }
         }
 
@@ -870,6 +1016,46 @@ async function applyInitialNavigationFromUrl() {
     } catch (e) {
         // Never break the page because of URL parsing
         console.warn('Initial navigation parsing failed:', e);
+    } finally {
+        // **הניקוי ב-``finally`` בכוונה.** גם אם הצריכה נכשלה באמצע, פרמטר
+        // כוונה שנשאר ב-URL ימשיך לכפות את עצמו בכל ריענון — וזה בדיוק
+        // הכשל שהפונקציה הזו נועדה לסגור.
+        consumeOneShotUrlParams();
+    }
+}
+
+/**
+ * מסיר מה-URL את פרמטרי הכוונה החד-פעמיים, ומשאיר את ה-hash כמו שהוא.
+ *
+ * ``repo``, ``note`` ו-``no_cache`` אומרים "פתח את X" — הוראה לטעינה אחת.
+ * הם אינם מתארים את מצב העמוד, ולכן אסור להם לשרוד אותה. כל עוד הם
+ * נשארים, ``get_current_repo_name`` בשרת נותנת ל-``repo`` עדיפות **מעל
+ * ה-session**, וכל ריענון מחזיר את המשתמש לריפו של הקישור המקורי — גם
+ * אחרי שהוא כבר עבר לריפו אחר, וגם על חשבון הבחירה השמורה שלו.
+ *
+ * ה-hash הוא ההפך: ``#file=`` הוא מצב מתמשך שמתאר מה פתוח עכשיו,
+ * ``updateUrlHash`` מתחזק אותו בכל ניווט, והוא חייב לשרוד.
+ */
+function consumeOneShotUrlParams() {
+    try {
+        const url = new URL(window.location.href);
+        const oneShot = ['repo', 'note', 'note_id', 'no_cache', 'nc'];
+        let touched = false;
+        for (const key of oneShot) {
+            if (url.searchParams.has(key)) {
+                url.searchParams.delete(key);
+                touched = true;
+            }
+        }
+        // בלי השער הזה כל טעינת עמוד הייתה כותבת היסטוריה בלי סיבה.
+        if (!touched) return;
+
+        // ``url.search`` כבר נושא את ``?`` כשיש פרמטרים, ומחרוזת ריקה כשאין —
+        // ולכן שרשור ישיר נותן גם ``/repo/`` נקי וגם ``/repo/?x=1``.
+        history.replaceState(null, '', url.pathname + url.search + url.hash);
+    } catch (e) {
+        // ניקוי URL אינו שווה שבירת עמוד.
+        console.warn('Failed to clean one-shot URL params:', e);
     }
 }
 
@@ -1379,9 +1565,49 @@ function loadFilterPreferences() {
 // File Selection & CodeMirror
 // ========================================
 
+/**
+ * מונה הבחירות. כל בחירת קובץ מקבלת מספר, והאחרון הוא היחיד שרשאי לפלוט
+ * ``repo:file-loaded``.
+ *
+ * **למה זה נחוץ:** הטעינה אסינכרונית, ושתי לחיצות מהירות משאירות שתי
+ * טעינות באוויר. בלי המונה, זו שנחתה מאוחר יותר — לא זו שנבחרה אחרונה —
+ * הייתה קובעת: פתקים של קובץ א' מעל תוכן של קובץ ב', או ניקוי (בכשל של
+ * טעינה ישנה) שמפרק את הפתקים של הקובץ שכן הוצג.
+ */
+let fileSelectionSeq = 0;
+
+/**
+ * האם העבודה שהתחילה בבחירה ``seq`` עדיין רלוונטית.
+ *
+ * ``undefined``/``null`` פירושו "לא נבחרה בהקשר של בחירת קובץ" — למשל
+ * מתג ה-Markdown, שרץ על הקובץ שכבר מוצג — ואז אין מה לבטל.
+ *
+ * **למה הבדיקה חוזרת אחרי כל ``await``:** בדיקה נקודתית אחת אחרי ה-fetch
+ * אינה מספיקה, כי הרינדור עצמו אסינכרוני. ``initCodeViewer`` ממתין
+ * ל-runtime של CodeMirror ורק אז הורס ובונה את העורך; ``renderMarkdownPreview``
+ * ממתין לתלויות ורק אז כותב ``innerHTML``. בחלון הזה בחירה חדשה יכולה
+ * להסתיים — ואז הישנה, כשהיא חוזרת, דורסת אותה.
+ */
+function selectionIsCurrent(seq) {
+    return seq === undefined || seq === null || seq === fileSelectionSeq;
+}
+
 async function selectFile(path, element) {
+    // הבחירה הזו היא האחרונה **נכון לרגע הזה**, וסינכרונית — כדי שטעינה
+    // קודמת שעדיין באוויר תגלה בסופה שהיא כבר לא.
+    const mySeq = ++fileSelectionSeq;
+    // צילום הריפו בתחילת הבחירה. החלפת ריפו תוך כדי טעינה משנה את
+    // ``data-repo``, וקריאה ממנו בסוף הטעינה הייתה מצמידה את הקובץ הזה
+    // לריפו אחר — כלומר פתקים של ``(ריפו חדש, קובץ ישן)``, זוג שלא קיים.
+    const repoAtStart = repoNameFromDom();
+
     // Close any active in-file search when switching files
     closeInFileSearch();
+
+    // **ניקוי מיד, הרכבה רק בסוף.** הפתקים של הקובץ הקודם יושבים מעל אותו
+    // קונטיינר, ובלי הניקוי כאן הם היו נשארים תלויים מעל התוכן החדש לכל
+    // אורך הטעינה — ובכשל, גם מעל הודעת השגיאה.
+    emitRepoFileEvent(null, repoAtStart);
     
     // Update selection UI
     if (state.selectedElement) {
@@ -1396,7 +1622,7 @@ async function selectFile(path, element) {
     state.currentFileContent = null;
     state.currentFileLanguage = null;
     state.editorFilePath = null;
-    
+
     // Update URL hash to persist state across refresh
     updateUrlHash(path);
     
@@ -1436,6 +1662,14 @@ async function selectFile(path, element) {
         const response = await fetch(`${CONFIG.apiBase}/file/${encodeURIComponent(path)}?${getRepoParam()}`);
         const data = await response.json();
 
+        // **בקשה שנעקפה יוצאת כאן, לפני כל התחייבות.** השומר שהיה קיים
+        // עטף רק את פליטת אירוע הפתקים, בעוד ששאר מסלול ההתחייבות —
+        // ``state.currentFileContent``, הכותרת, ה-breadcrumbs ו-CodeMirror
+        // — רץ בכל מקרה. התוצאה: טעינה איטית של קובץ א' שנחתה אחרי שכבר
+        // עברנו לב' דרסה את תוכן העורך בתוכן של א', בעוד הפתקים והכותרת
+        // נשארו של ב'. יציאה אחת כאן מכסה את כל המסלול.
+        if (mySeq !== fileSelectionSeq) return;
+
         if (data.error) {
             throw new Error(data.error);
         }
@@ -1462,18 +1696,33 @@ async function selectFile(path, element) {
 
         if (isMarkdown && savedPreference) {
             // המשתמש העדיף תצוגת Markdown - הצג אותה
-            await enableMarkdownPreview();
+            await enableMarkdownPreview(mySeq);
         } else {
             // הצג קוד רגיל
             disableMarkdownPreview();
-            await initCodeViewer(data.content, language);
+            await initCodeViewer(data.content, language, mySeq);
         }
+
+        // הרינדור היה אסינכרוני — בדיקה חוזרת לפני שאר ההתחייבויות.
+        if (mySeq !== fileSelectionSeq) return;
 
         // Save to recent files
         addToRecentFiles(path);
 
+        // התפר לפתקים — **רק אחרי שהקובץ באמת נטען, ורק אם זו עדיין
+        // הבחירה הפעילה.** הרכבה מוקדמת (לפני ה-fetch) הייתה מעמידה פתקים
+        // על קובץ שאולי נכשל להיטען; הרכבה של טעינה שנעקפה הייתה מעמידה
+        // אותם על תוכן של קובץ אחר. מי שמאזין (sticky-notes) לא נכנס
+        // לפנימיות של הדפדפן, והדפדפן לא יודע עליו.
+        if (mySeq === fileSelectionSeq) emitRepoFileEvent(path, repoAtStart);
+
     } catch (error) {
         console.error('Failed to load file:', error);
+        // כשל של טעינה **שנעקפה** אינו אומר כלום על הקובץ שכן מוצג: לא
+        // ניקוי פתקים, וגם לא הודעת שגיאה שתידרס על תוכן תקין שכבר מוצג.
+        // הניקוי בתחילת הבחירה כבר רץ.
+        if (mySeq !== fileSelectionSeq) return;
+        emitRepoFileEvent(null, repoAtStart);
         wrapper.innerHTML = `
             <div class="error-message" style="padding: 20px; color: var(--accent-red);">
                 <i class="bi bi-exclamation-triangle"></i>
@@ -1483,11 +1732,16 @@ async function selectFile(path, element) {
     }
 }
 
-async function initCodeViewer(content, language) {
+async function initCodeViewer(content, language, seq) {
     const wrapper = document.getElementById('code-editor-wrapper');
     if (!wrapper) return;
 
     const kind = await ensureCodeMirrorRuntime();
+
+    // **בחירה חדשה גברה בזמן שחיכינו ל-runtime.** בלי היציאה כאן, הבחירה
+    // הישנה הייתה הורסת את העורך שהחדשה כבר בנתה ובונה אותו מחדש עם
+    // התוכן הישן — כלומר הישן מנצח דווקא בגלל שהוא איטי.
+    if (!selectionIsCurrent(seq)) return;
 
     // Destroy previous instances
     if (state.editor) {
@@ -1538,6 +1792,12 @@ async function initCodeViewer(content, language) {
         
         // Refresh editor after DOM update
         setTimeout(recalculateEditorHeight, 100);
+        // **גם כאן, ולא רק בהחלפת התצוגה.** ``disableMarkdownPreview``
+        // פולט לפני ש-``ensureCodeViewerInitialized`` בונה את העורך, ולכן
+        // בקובץ ``.md`` שנפתח ישר בתצוגת Markdown הגולל של הקוד עדיין לא
+        // קיים באותו רגע — הרענון היה no-op, ואירוע נוסף לא הגיע. הנקודה
+        // הזו היא שינוי המצב "הגולל נהיה זמין".
+        emitRepoViewChanged();
         return;
     }
 
@@ -1588,6 +1848,14 @@ async function initCodeViewer(content, language) {
             extensions.push(EditorState.readOnly.of(true));
         }
 
+        // **המתנה שנייה, ולכן בדיקה שנייה.** ``getTheme`` הוא ``await``
+        // נוסף אחרי השומר שבראש הפונקציה, ובזמנו בחירה חדשה יכולה
+        // להסתיים ולבנות את העורך שלה. בלי הבדיקה כאן, הבחירה הישנה
+        // הייתה בונה עורך עם התוכן הישן ודורסת את ``state.editorView6``
+        // — ובנוסף מרכיבה אותו לתוך ``mountEl`` שנלכד לפני ההמתנה וכבר
+        // נותק מה-DOM.
+        if (!selectionIsCurrent(seq)) return;
+
         const cmState = EditorState.create({
             doc: String(content || ''),
             extensions
@@ -1599,6 +1867,8 @@ async function initCodeViewer(content, language) {
         });
         state.editorFilePath = state.currentFile;
 
+        // אותה סיבה כמו בענף cm5 — ראו שם.
+        emitRepoViewChanged();
         return;
     }
 
@@ -2297,41 +2567,101 @@ function initKeyboardShortcuts() {
 function initResizer() {
     const resizer = document.getElementById('sidebar-resizer');
     const sidebar = document.getElementById('repo-sidebar');
-    
+
     if (!resizer || !sidebar) return;
 
-    let isResizing = false;
-    let startX, startWidth;
+    // **Pointer Events ולא ענף מגע מקביל.** עכבר, מגע ועט מגיעים לאותם
+    // ``pointerdown``/``pointermove``/``pointerup``, ולכן יש כאן מסלול קוד
+    // אחד במקום שניים שנוטים להיסחף זה מזה. ``touch-action: pan-y`` על
+    // ה-resizer ב-CSS הוא שמחלק את המחוות: הגלילה האנכית נשארת לדפדפן,
+    // והתנועה האופקית מגיעה לכאן. כשהדפדפן מכריע שמדובר בגלילה הוא שולח
+    // ``pointercancel``, ולכן יש לו מאזין למטה.
+    let activePointer = null;
+    let startX = 0;
+    let startWidth = 0;
+    // +1 כשהסיידבר משמאל למפריד, -1 כשהוא מימינו. ראו ``sidebarSign``.
+    let widthSign = 1;
 
-    resizer.addEventListener('mousedown', (e) => {
-        isResizing = true;
+    /**
+     * לאיזה כיוון להזיז את הקצה כדי להרחיב, נגזר מהפריסה בפועל.
+     *
+     * **למה מדידה ולא קבוע.** המפריד הוא גבול בין שני אזורים, והמשתמש
+     * מצפה שהוא יעקוב אחרי האצבע. הנוסחה ``startWidth + dx`` נכונה רק
+     * כשהסיידבר משמאל למפריד; בפריסת RTL הוא מימינו, ואז אותה נוסחה
+     * מזיזה את הקצה **הפוך מהאצבע** — המפריד בורח ממנה. הסימן נגזר כאן
+     * מהמיקומים האמיתיים, ולכן הוא נכון גם אם הכיוון או סדר האלמנטים
+     * ישתנו, ואינו מניח RTL.
+     */
+    function sidebarSign() {
+        const r = resizer.getBoundingClientRect();
+        const s = sidebar.getBoundingClientRect();
+        // מרכז מול מרכז: עמיד יותר מהשוואת קצוות כשיש חפיפה של פיקסל.
+        return (s.left + s.right) / 2 < (r.left + r.right) / 2 ? 1 : -1;
+    }
+
+    // מהדק לגבולות במקום לזרוק ערך מחוץ לטווח. הצורה הקודמת התעלמה
+    // מהעדכון כשהוא חרג, ולכן קפיצה אחת מעבר לגבול (גרירה מהירה, או אצבע
+    // שזזה הרבה בין דגימות) הותירה את הסיידבר על הערך התקין האחרון ולא
+    // על הגבול עצמו.
+    function clampWidth(raw) {
+        const cs = getComputedStyle(document.documentElement);
+        const min = parseInt(cs.getPropertyValue('--sidebar-min-width'), 10);
+        const max = parseInt(cs.getPropertyValue('--sidebar-max-width'), 10);
+        if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+        return Math.min(Math.max(raw, min), max);
+    }
+
+    function endDrag(e) {
+        if (e.pointerId !== activePointer) return;
+        activePointer = null;
+        resizer.classList.remove('active');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+    }
+
+    resizer.addEventListener('pointerdown', (e) => {
+        // אצבע שנייה על המפריד באמצע גרירה אינה מתחילה גרירה שנייה.
+        if (activePointer !== null) return;
+        // רק הלחצן הראשי. במגע ובעט ``button`` הוא 0, ולכן התנאי אינו
+        // חוסם אותם.
+        if (e.button !== 0) return;
+
+        activePointer = e.pointerId;
         startX = e.clientX;
         startWidth = sidebar.offsetWidth;
+        // נמדד בתחילת כל גרירה ולא פעם אחת באתחול: הפריסה יכולה להשתנות
+        // בין גרירה לגרירה (שינוי גודל חלון, החלפת ערכה, מעבר לנייד).
+        widthSign = sidebarSign();
+        // **לכידת המצביע.** בלעדיה גרירה במגע מתה ברגע שהאצבע יוצאת מרצועת
+        // ארבעת הפיקסלים — כלומר כמעט מיד. עם הלכידה, האירועים ממשיכים
+        // להגיע ל-resizer, והשחרור קורה מאליו ב-``pointerup``.
+        // הלכידה היא שיפור, לא תנאי: אירוע לכוד עדיין מבעבע ל-``document``,
+        // ולכן המאזינים שם עובדים איתה ובלעדיה. אם היא נכשלת, הגרירה
+        // ממשיכה לעבוד במקום להיתקע במצב פעיל.
+        try { resizer.setPointerCapture(e.pointerId); } catch (_) { /* ממשיכים בלי לכידה */ }
         resizer.classList.add('active');
         document.body.style.cursor = 'col-resize';
         document.body.style.userSelect = 'none';
+        // מונע בחירת טקסט בעכבר, וגרירת-ברירת-מחדל של הדפדפן.
+        e.preventDefault();
     });
 
-    document.addEventListener('mousemove', (e) => {
-        if (!isResizing) return;
-        
-        const width = startWidth + (e.clientX - startX);
-        const minWidth = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--sidebar-min-width'));
-        const maxWidth = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--sidebar-max-width'));
-        
-        if (width >= minWidth && width <= maxWidth) {
-            sidebar.style.width = `${width}px`;
-        }
+    // **ההמשך מאזין על ``document`` ולא על המפריד.** עם לכידה האירועים
+    // ממוענים למפריד ובכל זאת מבעבעים לכאן, ובלי לכידה — למשל אם
+    // ``setPointerCapture`` נכשל — הם מגיעים לכאן ישירות. מסלול אחד שמכסה
+    // את שני המצבים, במקום ענף גיבוי נפרד שיסתחף.
+    document.addEventListener('pointermove', (e) => {
+        if (e.pointerId !== activePointer) return;
+        const width = clampWidth(startWidth + widthSign * (e.clientX - startX));
+        if (width !== null) sidebar.style.width = `${width}px`;
     });
 
-    document.addEventListener('mouseup', () => {
-        if (isResizing) {
-            isResizing = false;
-            resizer.classList.remove('active');
-            document.body.style.cursor = '';
-            document.body.style.userSelect = '';
-        }
-    });
+    document.addEventListener('pointerup', endDrag);
+    // **``pointercancel`` אינו קישוט.** מחווה של המערכת שקוטעת את הגרירה —
+    // וגם הכרעת הדפדפן שהתנועה היא גלילה אנכית, לפי ``touch-action: pan-y``
+    // — שולחת אותו במקום ``pointerup``. בלעדיו הדגל היה נשאר דלוק,
+    // והסיידבר היה ממשיך להשתנות בכל תזוזה הבאה.
+    document.addEventListener('pointercancel', endDrag);
 }
 
 // ========================================

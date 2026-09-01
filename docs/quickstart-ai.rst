@@ -1,9 +1,6 @@
 התחלה מהירה - סוכני AI
 =========================
-
-מטרה
------
-מסמך זה נועד לאפשר לסוכן AI להתחיל לעבוד על הריפו במהירות ובבטחה, בהתאם למדיניות הפרויקט.
+:summary: מסמך זה נועד לאפשר לסוכן AI להתחיל לעבוד על הריפו במהירות ובבטחה, בהתאם למדיניות הפרויקט.
 
 מה אסור
 --------
@@ -52,7 +49,7 @@
    def safe_rmtree(path: Path, allow_under: Path) -> None:
        p = path.resolve()
        base = allow_under.resolve()
-       if not str(p).startswith(str(base)) or p in (Path('/'), base.parent, Path.cwd()):
+       if not (p == base or base in p.parents) or p in (Path('/'), base.parent, Path.cwd()):
            raise RuntimeError(f"Refusing to delete unsafe path: {p}")
        shutil.rmtree(p)
 

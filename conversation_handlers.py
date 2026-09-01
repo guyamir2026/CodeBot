@@ -22,7 +22,7 @@ from telegram.ext import (
     filters,
 )
 
-from file_manager import backup_manager
+from file_manager import backup_manager, skill_manager
 # Reporter מוזרק בזמן ריצה כדי להימנע מפתיחת חיבור בעת import
 class _NoopReporter:
     def report_activity(self, user_id):
@@ -40,6 +40,7 @@ from html import escape as html_escape
 from utils import TelegramUtils, TextUtils, ValidationUtils
 from services import code_service
 from i18n.strings_he import MAIN_MENU as MAIN_KEYBOARD
+from i18n.strings_he import BTN_BACKUP_ZIPS
 from handlers.pagination import build_pagination_row
 from config import config
 from urllib.parse import quote_plus
@@ -688,7 +689,7 @@ HELP_PAGES = [
         "🗂 <b>לפי ריפו</b> — קבצים מאורגנים לפי פרויקט\n"
         "📂 <b>קבצים גדולים</b> — תצוגה מדורגת לקבצים ארוכים\n"
         "📁 <b>שאר הקבצים</b> — כל השאר\n"
-        "📦 <b>קבצי ZIP</b> — גיבויים/ארכיונים\n\n"
+        "📦 <b>קבצי גיבוי</b> — ארכיוני ZIP (גיבויים וריפואים מגיטהאב)\n\n"
         "<b>לכל קובץ יש תפריט עם:</b>\n"
         "👁️ הצג | ✏️ ערוך | 📝 שנה שם\n"
         "📚 היסטוריה | 📥 הורד | 🗑️ העבר לסל\n\n"
@@ -870,6 +871,144 @@ async def start_zip_create_flow(update: Update, context: ContextTypes.DEFAULT_TY
         pass
     return ConversationHandler.END
 
+
+def _cleanup_zip_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """מנקה את דגלי מצב יצירת ה‑ZIP (אחרי סיום/ביטול/בחירת שם)."""
+    for key in ('upload_mode', 'zip_create_items', 'awaiting_zip_name'):
+        context.user_data.pop(key, None)
+
+
+def _count_and_save_skill(raw: bytes, user_id: int, original_name: str):
+    """סופר קבצים ב-ZIP ושומר כסקיל — הכל בפעולה אחת שרצה ב-thread (לא חוסם את ה-event loop).
+
+    הספירה לתצוגה בלבד (קריאה; אינה משנה את ה-bytes הנשמרים); בכשל ספירה נופלים ל-0.
+    """
+    file_count = 0
+    try:
+        import zipfile as _zipfile
+        with _zipfile.ZipFile(BytesIO(raw)) as _zf:
+            file_count = sum(1 for n in _zf.namelist() if not n.endswith("/"))
+    except Exception:
+        file_count = 0
+    md = {"user_id": user_id, "original_name": original_name, "file_count": file_count}
+    return skill_manager.save_skill_bytes(raw, md)
+
+
+async def _handle_zip_route(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
+    """מטפל בבחירת יעד ל-ZIP שהועלה: '🧩 סקיל' (אחסון קבוע as-is) או '📦 גיבוי' (רשימת הגיבויים).
+
+    ה-bytes נטענים מהקובץ הזמני שנשמר ב-_maybe_store_zip_copy; השמירה הכבדה רצה ב-thread נפרד
+    כדי לא לחסום את לולאת האירועים.
+    """
+    query = update.callback_query
+    await query.answer()
+    from utils import load_pending_zip_bytes, cleanup_pending_zip
+
+    token = data.partition(":")[2]
+    user_id = update.effective_user.id
+    pending = context.user_data.get("pending_zip") or {}
+    entry = pending.get(token)
+    raw = None
+    if entry:
+        raw = await asyncio.to_thread(load_pending_zip_bytes, (entry or {}).get("path", ""))
+
+    if not entry or raw is None:
+        # הטוקן פג/נוקה (או שהבוט אותחל) — אין bytes לשחזר
+        await TelegramUtils.safe_edit_message_text(
+            query, "⌛ הקובץ פג. שלח/י אותו שוב כדי לבחור סקיל או גיבוי."
+        )
+        if entry:
+            cleanup_pending_zip((entry or {}).get("path", ""))
+            pending.pop(token, None)
+        return
+
+    original_name = entry.get("original_name") or "upload.zip"
+
+    if data.startswith("zip_route_skill:"):
+        skill_id = await asyncio.to_thread(_count_and_save_skill, raw, user_id, original_name)
+        if skill_id:
+            # ניקוי רק לאחר שמירה מוצלחת — בכשל שומרים את ה-token/bytes כדי לאפשר retry
+            cleanup_pending_zip(entry.get("path", ""))
+            pending.pop(token, None)
+            await TelegramUtils.safe_edit_message_text(
+                query,
+                f"✅ נשמר כסקיל: <code>{html_escape(original_name)}</code>\n"
+                "🔎 ניתן למצוא אותו תחת: '📚' ← '🧩 סקילים'.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await TelegramUtils.safe_edit_message_text(
+                query, "❌ שמירת הסקיל נכשלה. נסה/י שוב מאוחר יותר."
+            )
+        return
+
+    # zip_route_backup — לוגיקת הגיבוי המקורית (save_backup_bytes מזריק metadata.json בעצמו)
+    backup_id = f"upload_{user_id}_{int(time.time())}"
+    md = {
+        "backup_id": backup_id,
+        "backup_type": "generic_zip",
+        "user_id": user_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "original_filename": original_name,
+        "source": "uploaded_document",
+    }
+    result_id = await asyncio.to_thread(backup_manager.save_backup_bytes, raw, md)
+    if result_id:
+        # ניקוי רק לאחר שמירה מוצלחת — בכשל שומרים את ה-token/bytes כדי לאפשר retry
+        cleanup_pending_zip(entry.get("path", ""))
+        pending.pop(token, None)
+        await TelegramUtils.safe_edit_message_text(
+            query,
+            "✅ קובץ ZIP נשמר בהצלחה לרשימת ה‑ZIP השמורים.\n"
+            f"📦 ניתן למצוא אותו תחת: '📚' ← '{BTN_BACKUP_ZIPS}' או ב‑Batch/GitHub."
+        )
+    else:
+        await TelegramUtils.safe_edit_message_text(
+            query, "❌ שמירת הגיבוי נכשלה. נסה/י שוב מאוחר יותר."
+        )
+
+
+async def finalize_zip_create(update: Update, context: ContextTypes.DEFAULT_TYPE, zip_name: Optional[str] = None) -> None:
+    """בונה ZIP מהקבצים שנאספו ושולח למשתמש.
+
+    אם zip_name ניתן — משתמשים בו לאחר ניקוי (TextUtils.clean_filename) והבטחת סיומת .zip;
+    אחרת נופלים לשם ברירת המחדל my-files-<timestamp>.zip.
+    """
+    items = context.user_data.get('zip_create_items') or []
+    msg = update.effective_message
+    if not items:
+        if msg is not None:
+            await msg.reply_text("ℹ️ לא נאספו קבצים. שלח/י קבצים ואז נסה שוב.")
+        _cleanup_zip_state(context)
+        return
+    try:
+        from io import BytesIO as _BytesIO
+        from utils import build_zip_bytes, TextUtils
+        # בניית ה-ZIP (סינכרונית/כבדה) מחוץ ל-event loop — עם ניקוי שמות (Zip-Slip) ואכיפת מגבלות
+        zip_bytes = await asyncio.to_thread(build_zip_bytes, items)
+        buf = _BytesIO(zip_bytes)
+        buf.seek(0)
+        # קביעת שם ה‑ZIP: שם מהמשתמש (מנוקה) או ברירת מחדל לפי חותמת זמן
+        default_base = f"my-files-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        base = ''
+        if zip_name:
+            try:
+                base = (TextUtils.clean_filename(zip_name) or '').strip()
+            except Exception:
+                base = ''
+            if base.lower().endswith('.zip'):
+                base = base[:-4]
+        safe_name = f"{base or default_base}.zip"
+        await msg.reply_document(document=buf, filename=safe_name)
+        await msg.reply_text(f'✅ נוצר ZIP "{safe_name}" עם {len(items)} קבצים ונשלח אליך.')
+    except Exception as e:
+        logger.exception(f"finalize_zip_create failed: {e}")
+        if msg is not None:
+            await msg.reply_text(f"❌ שגיאה ביצירת ה‑ZIP: {e}")
+    finally:
+        _cleanup_zip_state(context)
+
+
 async def show_by_repo_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """מציג תפריט קבוצות לפי תגיות ריפו ומאפשר בחירה."""
     user_id = update.effective_user.id
@@ -938,7 +1077,8 @@ async def show_all_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard = [
             [InlineKeyboardButton("🔎 חפש קובץ", callback_data="search_files")],
             [InlineKeyboardButton("🗂 לפי ריפו", callback_data="by_repo_menu")],
-            [InlineKeyboardButton("📦 קבצי ZIP", callback_data="backup_list")],
+            [InlineKeyboardButton(BTN_BACKUP_ZIPS, callback_data="backup_list")],
+            [InlineKeyboardButton("🧩 סקילים", callback_data="skill_list")],
             [InlineKeyboardButton("📂 קבצים גדולים", callback_data="show_large_files")],
             [InlineKeyboardButton("📁 שאר הקבצים", callback_data="show_regular_files")],
             [InlineKeyboardButton("⭐ מועדפים", callback_data="show_favorites")],
@@ -1008,7 +1148,8 @@ async def show_all_files_callback(update: Update, context: ContextTypes.DEFAULT_
             pass
         keyboard = [
             [InlineKeyboardButton("🗂 לפי ריפו", callback_data="by_repo_menu")],
-            [InlineKeyboardButton("📦 קבצי ZIP", callback_data="backup_list")],
+            [InlineKeyboardButton(BTN_BACKUP_ZIPS, callback_data="backup_list")],
+            [InlineKeyboardButton("🧩 סקילים", callback_data="skill_list")],
             [InlineKeyboardButton("📂 קבצים גדולים", callback_data="show_large_files")],
             [InlineKeyboardButton("📁 שאר הקבצים", callback_data="show_regular_files")],
             [InlineKeyboardButton("⭐ מועדפים", callback_data="show_favorites")],
@@ -2214,12 +2355,19 @@ async def share_single_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if not code:
             await query.edit_message_text("❌ תוכן הקובץ ריק או חסר")
             return ConversationHandler.END
-        from integrations import code_sharing
+        from integrations import code_sharing, resolve_gist_for_user
         if service == 'gist':
-            if not config.GITHUB_TOKEN:
-                await query.edit_message_text("❌ Gist לא זמין (חסר GITHUB_TOKEN)")
+            # ה-Gist נוצר תחת חשבון ה-GitHub של המשתמש, לא של המערכת.
+            # שתי הקריאות חוסמות (DB ורשת) ולכן רצות בת'רד נפרד.
+            gist, gist_error = await asyncio.to_thread(resolve_gist_for_user, user_id)
+            if gist is None:
+                await query.edit_message_text(gist_error)
                 return ConversationHandler.END
-            result = await code_sharing.share_code('gist', file_name, code, language, description=f"שיתוף דרך CodeBot — {file_name}")
+            result = await asyncio.to_thread(
+                gist.create_gist,
+                file_name, code, language,
+                description=f"שיתוף דרך CodeBot — {file_name}",
+            )
             if not result or not result.get('url'):
                 await query.edit_message_text("❌ יצירת Gist נכשלה")
                 return ConversationHandler.END
@@ -3739,9 +3887,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
             return next_state
         elif data == "zip_create_cancel":
-            # ביטול מצב יצירת ZIP בלבד
-            context.user_data.pop('upload_mode', None)
-            context.user_data.pop('zip_create_items', None)
+            # ביטול מצב יצירת ZIP (כולל מצב המתנה לשם) — ניקוי מלא של הדגלים כולל awaiting_zip_name
+            _cleanup_zip_state(context)
             await query.edit_message_text("🚫 יצירת ה‑ZIP בוטלה.")
             await query.message.reply_text(
                 "🎮 בחר פעולה מתקדמת:",
@@ -3749,32 +3896,35 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return ConversationHandler.END
         elif data == "zip_create_finish":
-            # בניית ZIP מהקבצים שנאספו ושליחה למשתמש
-            try:
-                items = context.user_data.get('zip_create_items') or []
-                if not items:
-                    await query.edit_message_text("ℹ️ לא נאספו קבצים. שלח/י קבצים ואז נסה שוב.")
-                    return ConversationHandler.END
-                from io import BytesIO as _BytesIO
-                import zipfile as _zip
-                buf = _BytesIO()
-                with _zip.ZipFile(buf, 'w', compression=_zip.ZIP_DEFLATED) as z:
-                    for it in items:
-                        # it: {"filename": str, "bytes": bytes}
-                        try:
-                            z.writestr(it.get('filename') or 'file', it.get('bytes') or b'')
-                        except Exception:
-                            pass
-                buf.seek(0)
-                safe_name = f"my-files-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.zip"
-                await query.message.reply_document(document=buf, filename=safe_name)
-                await query.edit_message_text(f"✅ נוצר ZIP עם {len(items)} קבצים ונשלח אליך.")
-            except Exception as e:
-                logger.exception(f"zip_create_finish failed: {e}")
-                await query.edit_message_text(f"❌ שגיאה ביצירת ה‑ZIP: {e}")
-            finally:
-                context.user_data.pop('upload_mode', None)
-                context.user_data.pop('zip_create_items', None)
+            # לפני יצירת ה‑ZIP — מבקשים מהמשתמש שם (או דילוג לשם אוטומטי)
+            items = context.user_data.get('zip_create_items') or []
+            if not items:
+                await query.edit_message_text("ℹ️ לא נאספו קבצים. שלח/י קבצים ואז נסה שוב.")
+                _cleanup_zip_state(context)
+                return ConversationHandler.END
+            context.user_data['awaiting_zip_name'] = True
+            # לא אוספים עוד קבצים בזמן שממתינים לשם
+            context.user_data.pop('upload_mode', None)
+            kb = [
+                [InlineKeyboardButton("⏭️ דלג (שם אוטומטי)", callback_data="zip_create_skip_name")],
+                [InlineKeyboardButton("❌ ביטול", callback_data="zip_create_cancel")],
+            ]
+            await query.edit_message_text(
+                "✍️ איך לקרוא ל‑ZIP?\n"
+                "שלח/י שם (בלי הסיומת .zip), או לחצ/י דלג לשם אוטומטי (או ביטול).\n"
+                f"📦 {len(items)} קבצים ייכללו.",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+            return ConversationHandler.END
+        elif data == "zip_create_skip_name":
+            # יצירת ZIP עם שם ברירת מחדל (דילוג על בחירת שם)
+            context.user_data.pop('awaiting_zip_name', None)
+            await query.edit_message_text("⏳ יוצר ZIP…")
+            await finalize_zip_create(update, context, zip_name=None)
+            return ConversationHandler.END
+        elif data.startswith("zip_route_skill:") or data.startswith("zip_route_backup:"):
+            # בחירת יעד ל-ZIP שהועלה: סקיל (אחסון קבוע) או גיבוי (רשימת הגיבויים)
+            await _handle_zip_route(update, context, data)
             return ConversationHandler.END
         elif data.startswith("replace_") or data == "rename_file" or data == "cancel_save":
             return await handle_duplicate_callback(update, context)
@@ -4624,7 +4774,7 @@ async def show_batch_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         send = update.message.reply_text
     keyboard = [
         [InlineKeyboardButton("🗂 לפי ריפו", callback_data="batch_cat:repos")],
-        [InlineKeyboardButton("📦 קבצי ZIP", callback_data="batch_cat:zips")],
+        [InlineKeyboardButton(BTN_BACKUP_ZIPS, callback_data="batch_cat:zips")],
         [InlineKeyboardButton("📂 קבצים גדולים", callback_data="batch_cat:large")],
         [InlineKeyboardButton("📁 שאר הקבצים", callback_data="batch_cat:other")],
         [InlineKeyboardButton("📋 סטטוס עבודות", callback_data="show_jobs")],
@@ -4752,7 +4902,7 @@ async def show_batch_zips_menu(update: Update, context: ContextTypes.DEFAULT_TYP
         if not backups:
             keyboard = [[InlineKeyboardButton("🔙 חזור", callback_data="batch_menu")]]
             await query.edit_message_text(
-                "ℹ️ לא נמצאו קבצי ZIP שמורים.",
+                "ℹ️ לא נמצאו קבצי גיבוי שמורים.",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return ConversationHandler.END
@@ -4768,7 +4918,7 @@ async def show_batch_zips_menu(update: Update, context: ContextTypes.DEFAULT_TYP
         end = min(start + PAGE_SIZE, total)
         items = backups[start:end]
 
-        lines = [f"📦 קבצי ZIP שמורים — סה""כ: {total}\n📄 עמוד {page} מתוך {total_pages}\n"]
+        lines = [f'{BTN_BACKUP_ZIPS} שמורים — סה"כ: {total}\n📄 עמוד {page} מתוך {total_pages}\n']
         keyboard = []
         # חישוב גרסאות vN לפי ריפו
         repo_to_sorted: Dict[str, list] = {}

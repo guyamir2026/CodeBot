@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Iterable, List, Optional, Protocol,
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 # שימוש ב-FilesFacade דרך Composition Root כדי להימנע מתלות ישירה ב-DB
@@ -27,11 +28,110 @@ from html import escape as html_escape
 
 logger = logging.getLogger(__name__)
 
+# לוג חד-פעמי לתהליך כשטלגרם דוחה את האימוג'י המותאם (תנאי פרימיום/ID לא תקף)
+_custom_emoji_warned = False
+
 # מגבלות ייבוא ZIP — הגנה מפני "פצצת ZIP" (דקומפרסיה מתפוצצת) בעת בניית ריפו מקובץ.
 # הבדיקות נעשות מול הגודל הלא-דחוס (ZipInfo.file_size) לפני קריאת התוכן לזיכרון.
 MAX_IMPORT_ZIP_MEMBERS = 2000  # מספר קבצים מקסימלי בארכיון לייבוא
 MAX_IMPORT_FILE_UNCOMPRESSED_BYTES = 50 * 1024 * 1024  # 50MB לקובץ בודד (לא דחוס)
 MAX_IMPORT_TOTAL_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500MB סך הכל (לא דחוס)
+
+
+def detect_zip_common_root(names: Iterable[str]) -> Optional[str]:
+    """
+    מזהה תיקיית שורש משותפת בארכיון, או ``None`` אם אין כזו.
+
+    תיקיית שורש קיימת רק אם *כל* הרשומות נמצאות תחתיה. אם יש ולו קובץ אחד
+    בשורש הארכיון, אין שורש משותף — אחרת ZIP כמו ``README.md`` + ``src/main.py``
+    היה מזוהה בטעות עם שורש ``src``, ו-``src/main.py`` היה נחתך ל-``main.py``.
+    """
+    top_levels = set()
+    has_root_level_file = False
+    for name in names:
+        if not name or name.startswith("__MACOSX/"):
+            continue
+        # קובצי AppleDouble (._x) מסוננים ממילא לפני הפריסה, ולכן ._x בשורש
+        # אינו "קובץ בשורש" לצורך החישוב — אחרת ZIP שנוצר ב-macOS היה מאבד
+        # את זיהוי תיקיית השורש בלי סיבה.
+        if name.split("/")[-1].startswith("._"):
+            continue
+        if "/" in name:
+            top_levels.add(name.split("/", 1)[0])
+        else:
+            has_root_level_file = True
+    if has_root_level_file or len(top_levels) != 1:
+        return None
+    root = next(iter(top_levels))
+    # ".." או "." אינם תיקיית שורש אמיתית. בלי הבדיקה הזו ארכיון שכל נתיביו
+    # מתחילים ב-"../" היה מקבל שורש ".." – וההסרה שלו הייתה מנקה את נתיב
+    # הבריחה במקום שהוא ייפסל בהמשך, כלומר מסתירה ארכיון חשוד.
+    if root in ("..", "."):
+        return None
+    return root
+
+
+def normalize_repo_folder(folder: str) -> str:
+    """
+    מנרמל נתיב של תיקיית יעד בריפו ומחזיר אותו בלי לוכסנים בקצוות.
+
+    מחזיר מחרוזת ריקה עבור שורש הריפו. זורק ``ValueError`` אם הנתיב מנסה
+    לצאת מהריפו (``..``), אם הוא נתיב מוחלט, או אם הוא מכיל תווים אסורים.
+    """
+    raw = (folder or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    # נתיב בריפו הוא תמיד יחסי לשורש שלו, ולכן "/docs" ו-"docs" זהים.
+    # מנרמלים במקום לדחות, כי זו טעות הקלדה נפוצה ולא ניסיון לברוח מהריפו.
+    raw = raw.lstrip("/")
+    if not raw:
+        return ""
+    # "C:/..." הוא כמעט תמיד הדבקה של נתיב מהמחשב, ולא כוונה אמיתית
+    if re.match(r"^[A-Za-z]:", raw):
+        raise ValueError("נתיב היעד חייב להיות יחסי לריפו (לא נתיב מהמחשב).")
+
+    parts: List[str] = []
+    for part in raw.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            raise ValueError("נתיב היעד לא יכול להכיל '..'.")
+        if "\x00" in part:
+            raise ValueError("נתיב היעד מכיל תווים לא חוקיים.")
+        parts.append(part)
+    return "/".join(parts)
+
+
+def sanitize_zip_member_path(path: str) -> Optional[str]:
+    """
+    מנקה נתיב של קובץ מתוך ZIP ומחזיר אותו, או ``None`` אם יש לדלג עליו.
+
+    זו ההגנה מפני Zip-Slip: ארכיון יכול להכיל נתיב כמו ``../../secrets``,
+    ובלעדיה הוא היה נכתב מחוץ לתיקיית היעד שהמשתמש בחר.
+    """
+    if not path:
+        return None
+    candidate = path.replace("\\", "/").strip()
+    if not candidate or candidate.endswith("/"):
+        return None
+    # נתיב מוחלט בתוך ארכיון אינו מסוכן כאן (היעד הוא git tree, לא דיסק),
+    # ולכן מנרמלים אותו במקום להשמיט את הקובץ בשקט.
+    candidate = candidate.lstrip("/")
+    if not candidate or re.match(r"^[A-Za-z]:", candidate):
+        return None
+
+    parts: List[str] = []
+    for part in candidate.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            return None
+        if "\x00" in part:
+            return None
+        parts.append(part)
+    if not parts:
+        return None
+    return "/".join(parts)
 
 
 class _ReporterProto(Protocol):
@@ -281,6 +381,10 @@ class DocumentHandler:
             await self._handle_github_create_repo_from_zip(update, context)
             return
 
+        if upload_mode == "github_zip_to_folder":
+            await self._handle_github_zip_to_folder(update, context)
+            return
+
         if context.user_data.get("waiting_for_github_upload") or upload_mode == "github":
             await self._handle_github_direct_upload(update, context)
             return
@@ -323,11 +427,7 @@ class DocumentHandler:
                         for n in all_names
                         if not (n.startswith("__MACOSX/") or n.split("/")[-1].startswith("._"))
                     ]
-                    top_levels = set()
-                    for name in zf.namelist():
-                        if "/" in name and not name.startswith("__MACOSX/"):
-                            top_levels.add(name.split("/", 1)[0])
-                    common_root = list(top_levels)[0] if len(top_levels) == 1 else None
+                    common_root = detect_zip_common_root(zf.namelist())
 
                     def strip_root(path: str) -> str:
                         if common_root and path.startswith(common_root + "/"):
@@ -509,11 +609,7 @@ class DocumentHandler:
                 total_uncompressed += entry_size
                 if total_uncompressed > MAX_IMPORT_TOTAL_UNCOMPRESSED_BYTES:
                     raise ValueError("סך התוכן הלא-דחוס בארכיון חורג מהמגבלה המותרת.")
-            top_levels = set()
-            for name in names_all:
-                if "/" in name and not name.startswith("__MACOSX/"):
-                    top_levels.add(name.split("/", 1)[0])
-            common_root = list(top_levels)[0] if len(top_levels) == 1 else None
+            common_root = detect_zip_common_root(names_all)
 
             def strip_root(path: str) -> str:
                 if common_root and path.startswith(common_root + "/"):
@@ -536,12 +632,21 @@ class DocumentHandler:
         user = g.get_user()
         return user.create_repo(name=repo_name, private=private, auto_init=False)
 
-    def _gh_upload_files(self, repo, files) -> int:
-        """מעלה את הקבצים לריפו החדש ומחזיר את מספר הקבצים שהוזנו.
+    def _gh_upload_files(
+        self,
+        repo,
+        files,
+        prefix: str = "",
+        commit_message: str = "Initial import from ZIP via bot",
+    ) -> int:
+        """מעלה את הקבצים לריפו ומחזיר את מספר הקבצים שהוזנו.
 
         פונקציה חוסמת (N קריאות רשת) שנועדה לרוץ ב-``asyncio.to_thread`` בלבד.
         משמרת את ההתנהגות המקורית: לריפו ריק (ללא base commit) יוצרים כל קובץ דרך
-        Contents API; לריפו עם היסטוריה בונים blobs+tree+commit.
+        Contents API; לריפו עם היסטוריה בונים blobs+tree+commit על גבי העץ הקיים,
+        כך ששאר הריפו אינו מושפע.
+
+        ``prefix`` מאפשר לפרוס את הקבצים לתוך תיקייה במקום לשורש.
         """
         from github.GithubException import GithubException
 
@@ -564,20 +669,21 @@ class DocumentHandler:
         if base_commit is None:
             created_count = 0
             for path, raw in files:
+                full_path = f"{prefix}/{path}" if prefix else path
                 # כשל API ביצירת קובץ מתפשט (ולא נבלע) כדי שלא נדווח על ייבוא מוצלח
                 # בעוד שחלק מהקבצים נכשלו; טיפול ה-UTF-8 מול בינארי נשמר.
                 try:
                     text = raw.decode("utf-8")
                     repo.create_file(
-                        path=path,
-                        message="Initial import from ZIP via bot",
+                        path=full_path,
+                        message=commit_message,
                         content=text,
                         branch=target_branch,
                     )
                 except UnicodeDecodeError:
                     repo.create_file(
-                        path=path,
-                        message="Initial import from ZIP via bot (binary)",
+                        path=full_path,
+                        message=f"{commit_message} (binary)",
                         content=raw,
                         branch=target_branch,
                     )
@@ -605,18 +711,24 @@ class DocumentHandler:
         )
         new_tree_elems: List[InputGitTreeElement] = []
         for path, raw in files:
-            try:
-                if path.lower().endswith(text_exts):
-                    blob = repo.create_git_blob(raw.decode("utf-8"), "utf-8")
-                else:
+            full_path = f"{prefix}/{path}" if prefix else path
+            # רק כשל בפענוח UTF-8 מוביל ל-base64. שגיאות API (הרשאות, rate limit)
+            # חייבות להתפשט, אחרת הן נבלעות ומדווחים על העלאה שלא באמת הצליחה.
+            if full_path.lower().endswith(text_exts):
+                try:
+                    content = raw.decode("utf-8")
+                except UnicodeDecodeError:
                     blob = repo.create_git_blob(base64.b64encode(raw).decode("ascii"), "base64")
-            except Exception:
+                else:
+                    blob = repo.create_git_blob(content, "utf-8")
+            else:
                 blob = repo.create_git_blob(base64.b64encode(raw).decode("ascii"), "base64")
-            new_tree_elems.append(InputGitTreeElement(path=path, mode="100644", type="blob", sha=blob.sha))
+            new_tree_elems.append(
+                InputGitTreeElement(path=full_path, mode="100644", type="blob", sha=blob.sha)
+            )
+        # base_tree מועבר תמיד: הפריסה מוסיפה על הקיים ולא מחליפה את הריפו
         new_tree = repo.create_git_tree(new_tree_elems, base_tree)
-        commit_message = "Initial import from ZIP via bot"
-        parents = [base_commit]
-        new_commit = repo.create_git_commit(commit_message, new_tree, parents)
+        new_commit = repo.create_git_commit(commit_message, new_tree, [base_commit])
         base_ref.edit(new_commit.sha)
         return len(new_tree_elems)
 
@@ -717,6 +829,123 @@ class DocumentHandler:
             context.user_data["upload_mode"] = None
             for key in ("new_repo_name", "new_repo_private"):
                 context.user_data.pop(key, None)
+
+    async def _handle_github_zip_to_folder(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """פורס את תוכן ה-ZIP לתוך תיקייה שנבחרה בריפו קיים."""
+        try:
+            document = update.message.document
+            user_id = update.effective_user.id
+
+            # היעד נקבע מראש בתפריט ונשמר, כדי שלא ישתנה בין הבחירה לשליחת הקובץ
+            try:
+                prefix = normalize_repo_folder(
+                    context.user_data.get("zip_to_folder_target") or ""
+                )
+            except ValueError as err:
+                await update.message.reply_text(f"❌ נתיב היעד אינו תקין: {err}")
+                return
+            if not prefix:
+                await update.message.reply_text(
+                    "❌ לא נבחרה תיקיית יעד. חזור לתפריט ובחר תיקייה."
+                )
+                return
+
+            github_handler = context.bot_data.get("github_handler")
+            session = github_handler.get_user_session(user_id) if github_handler else {}
+            token = github_handler.get_user_token(user_id) if github_handler else None
+            # היעד הנעול מנצח, כדי שהחלפת ריפו באמצע לא תשלח קבצים למקום אחר
+            repo_full = context.user_data.get("zip_to_folder_repo") or session.get("selected_repo")
+            if not (token and repo_full):
+                await update.message.reply_text("❌ אין טוקן או ריפו נבחר")
+                return
+
+            logger.info(
+                "GitHub zip-to-folder received: file_name=%s, size=%s, repo=%s, folder=%s",
+                document.file_name, document.file_size, repo_full, prefix,
+            )
+
+            await update.message.reply_text("⏳ מוריד קובץ ZIP...")
+            tg_file = await context.bot.get_file(document.file_id)
+            buf = BytesIO()
+            try:
+                await tg_file.download_to_memory(buf)
+                buf.seek(0)
+                if not zipfile.is_zipfile(buf):
+                    await update.message.reply_text("❌ הקובץ שהועלה אינו ZIP תקין.")
+                    return
+                # פרסור כבד מחוץ ל-event loop; כולל מגבלות נגד "פצצת ZIP"
+                files, _common_root, member_count = await asyncio.to_thread(
+                    self._parse_zip_for_import, buf
+                )
+            finally:
+                try:
+                    buf.close()
+                except Exception:
+                    pass
+
+            if not member_count or not files:
+                await update.message.reply_text("❌ לא נמצאו קבצים בתוך ה-ZIP")
+                return
+
+            # הגנת Zip-Slip: נתיב שמנסה לצאת מהתיקייה מדולג ולא נכתב לריפו
+            safe_files: List[tuple[str, bytes]] = []
+            skipped: List[str] = []
+            for path, raw in files:
+                clean = sanitize_zip_member_path(path)
+                if clean is None:
+                    skipped.append(path)
+                    continue
+                safe_files.append((clean, raw))
+
+            if skipped:
+                logger.warning(
+                    "[zip_to_folder] Skipped %s unsafe path(s), first: %s",
+                    len(skipped), skipped[:3],
+                )
+            if not safe_files:
+                await update.message.reply_text(
+                    "❌ כל הנתיבים ב-ZIP נדחו מטעמי בטיחות (נתיבים מוחלטים או '..')."
+                )
+                return
+
+            g_repo = await asyncio.to_thread(self._gh_get_repo, token, repo_full)
+            notice = ""
+            if skipped:
+                notice = f"\n⚠️ דולגו {len(skipped)} נתיבים לא בטוחים (מכילים '..' או נתיב מוחלט)."
+            target_label = f"{html_escape(repo_full)}/{html_escape(prefix)}"
+            await update.message.reply_text(
+                f"📤 מעלה {len(safe_files)} קבצים אל <code>{target_label}</code>...{notice}",
+                parse_mode=ParseMode.HTML,
+            )
+
+            count = await asyncio.to_thread(
+                self._gh_upload_files,
+                g_repo,
+                safe_files,
+                prefix,
+                f"Deploy ZIP contents to {prefix} via bot",
+            )
+
+            folder_url = f"https://github.com/{repo_full}/tree/{g_repo.default_branch or 'main'}/{prefix}"
+            await update.message.reply_text(
+                f"✅ נפרסו {count} קבצים לתיקייה\n"
+                f"🔗 <a href=\"{html_escape(folder_url)}\">{html_escape(repo_full)}/{html_escape(prefix)}</a>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as err:
+            logger.exception("ZIP to folder failed: %s", err)
+            await update.message.reply_text(f"❌ שגיאה בפריסת ZIP לתיקייה: {err}")
+            await self._maybe_alert_oom(context, err, "בפריסת ZIP לתיקייה")
+        finally:
+            context.user_data["upload_mode"] = None
+            for key in ("zip_to_folder_target", "zip_to_folder_repo"):
+                context.user_data.pop(key, None)
+
+    def _gh_get_repo(self, token: str, repo_full: str):
+        """מחזיר אובייקט ריפו. פונקציה חוסמת (רשת) ל-``asyncio.to_thread``."""
+        from github import Github
+
+        return Github(token).get_repo(repo_full)
 
     async def _handle_github_direct_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         github_handler = context.bot_data.get("github_handler")
@@ -839,18 +1068,40 @@ class DocumentHandler:
                 document.file_name,
                 document.file_size,
             )
-            file = await context.bot.get_file(document.file_id)
-            buf = BytesIO()
-            await file.download_to_memory(buf)
-            raw = buf.getvalue()
             items = context.user_data.get("zip_create_items")
             if items is None:
                 items = []
                 context.user_data["zip_create_items"] = items
+            # אכיפת מגבלות מוקדמת — לפני ההורדה לזיכרון (הגנה מ-DoS/זיכרון): מספר קבצים + גודל מוצהר
+            from utils import ZIP_CREATE_MAX_FILES, ZIP_CREATE_MAX_TOTAL_BYTES
+            limit_mb = ZIP_CREATE_MAX_TOTAL_BYTES // (1024 * 1024)
+            if len(items) >= ZIP_CREATE_MAX_FILES:
+                await update.message.reply_text(
+                    f"⚠️ הגעת למקסימום {ZIP_CREATE_MAX_FILES} קבצים ל-ZIP. לחצ/י 'סיום' כדי ליצור."
+                )
+                return
+            current_total = sum(len(it.get("bytes") or b"") for it in items)
+            incoming_size = int(getattr(document, "file_size", 0) or 0)
+            if current_total + incoming_size > ZIP_CREATE_MAX_TOTAL_BYTES:
+                await update.message.reply_text(
+                    f"⚠️ הקובץ לא נוסף — חריגה מהמגבלה של {limit_mb}MB לכלל ה-ZIP."
+                )
+                return
+            # הורדה רק לאחר שהמגבלות המוקדמות עברו
+            file = await context.bot.get_file(document.file_id)
+            buf = BytesIO()
+            await file.download_to_memory(buf)
+            raw = buf.getvalue()
+            # אימות סופי לפי הגודל בפועל (למקרה של פער מול file_size המוצהר)
+            if current_total + len(raw) > ZIP_CREATE_MAX_TOTAL_BYTES:
+                await update.message.reply_text(
+                    f"⚠️ הקובץ לא נוסף — חריגה מהמגבלה של {limit_mb}MB לכלל ה-ZIP."
+                )
+                return
             safe_name = (document.file_name or f"file_{len(items)+1}").strip() or f"file_{len(items)+1}"
             items.append({"filename": safe_name, "bytes": raw})
             await update.message.reply_text(
-                f"✅ נוסף: <code>{html_escape(safe_name)}</code> (סה""כ {len(items)} קבצים)",
+                f'✅ נוסף: <code>{html_escape(safe_name)}</code> (סה"כ {len(items)} קבצים)',
                 parse_mode=ParseMode.HTML,
             )
         except Exception as err:
@@ -975,54 +1226,108 @@ class DocumentHandler:
             if not (is_zip_hint and is_zip_actual):
                 return False
 
-            backup_id = f"upload_{update.effective_user.id}_{int(datetime.now(timezone.utc).timestamp())}"
-            target_path = backup_manager.backup_dir / f"{backup_id}.zip"
-            try:
-                try:
-                    with zipfile.ZipFile(BytesIO(raw_bytes), "r") as ztest:
-                        try:
-                            ztest.getinfo("metadata.json")
-                            md_bytes = raw_bytes
-                        except KeyError:
-                            md = {
-                                "backup_id": backup_id,
-                                "backup_type": "generic_zip",
-                                "user_id": update.effective_user.id,
-                                "created_at": datetime.now(timezone.utc).isoformat(),
-                                "original_filename": document.file_name,
-                                "source": "uploaded_document",
-                            }
-                            out_buf = BytesIO()
-                            with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-                                for name in ztest.namelist():
-                                    zout.writestr(name, ztest.read(name))
-                                zout.writestr("metadata.json", json.dumps(md, indent=2))
-                            md_bytes = out_buf.getvalue()
-                except Exception:
-                    md_bytes = raw_bytes
+            # ZIP זוהה — במקום שמירה אוטומטית לגיבוי, בקש מהמשתמש לבחור יעד: סקיל או גיבוי.
+            # ה-bytes נשמרים כמו שהם בקובץ זמני; הבחירה בפועל מתבצעת ב-callback (בחירה מפורשת בלבד).
+            from utils import (
+                stash_pending_zip_bytes,
+                cleanup_pending_zip,
+                cleanup_stale_pending_zips,
+                tg_emoji,
+                PENDING_ZIP_TTL_SECONDS,
+            )
+            from config import config
+            import uuid as _uuid
 
-                try:
-                    backup_manager.save_backup_bytes(
-                        md_bytes,
-                        {
-                            "backup_id": backup_id,
-                            "backup_type": "generic_zip",
-                            "user_id": update.effective_user.id,
-                            "created_at": datetime.now(timezone.utc).isoformat(),
-                            "original_filename": document.file_name,
-                            "source": "uploaded_document",
-                        },
-                    )
-                except Exception:
-                    with open(target_path, "wb") as fzip:
-                        fzip.write(md_bytes)
-                await update.message.reply_text(
-                    "✅ קובץ ZIP נשמר בהצלחה לרשימת ה‑ZIP השמורים.\n"
-                    "📦 ניתן למצוא אותו תחת: '📚' > '📦 קבצי ZIP' או ב‑Batch/GitHub."
-                )
-                return True
+            original_name = document.file_name or "upload.zip"
+
+            # ניקוי עצל: קבצים ממתינים ישנים (שלא נבחרו) — גם על הדיסק וגם ב-user_data.
+            # הסריקה סינכרונית (glob+stat) — רצה ב-thread כדי לא לחסום את לולאת האירועים.
+            try:
+                await asyncio.to_thread(cleanup_stale_pending_zips)
+            except Exception:
+                pass
+            pending = context.user_data.setdefault("pending_zip", {})
+            try:
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                stale_tokens = [
+                    t for t, m in pending.items()
+                    if now_ts - int((m or {}).get("ts", 0)) > PENDING_ZIP_TTL_SECONDS
+                ]
+                for _old in stale_tokens:
+                    cleanup_pending_zip((pending.get(_old) or {}).get("path", ""))
+                    pending.pop(_old, None)
+                # הגבלת מספר ה-ZIP הממתינים למשתמש — הסרת הישנים ביותר מעבר לקיבולת
+                MAX_PENDING = 5
+                if len(pending) >= MAX_PENDING:
+                    oldest = sorted(pending.items(), key=lambda kv: int((kv[1] or {}).get("ts", 0)))
+                    for _old, _meta in oldest[: len(pending) - MAX_PENDING + 1]:
+                        cleanup_pending_zip((_meta or {}).get("path", ""))
+                        pending.pop(_old, None)
+            except Exception:
+                pass
+
+            token = _uuid.uuid4().hex
+            try:
+                # כתיבה לדיסק — ב-thread כדי לא לחסום את לולאת האירועים
+                path = await asyncio.to_thread(stash_pending_zip_bytes, raw_bytes, token)
             except Exception as err:
-                logger.warning("Failed to persist uploaded ZIP: %s", err)
+                logger.warning("Failed to stash pending ZIP: %s", err)
+                return False
+            pending[token] = {
+                "path": path,
+                "original_name": original_name,
+                "size": len(raw_bytes),
+                "ts": int(datetime.now(timezone.utc).timestamp()),
+            }
+
+            # כפתורים: אימוג'י רגיל בלבד — inline keyboard לא תומך ב-custom emoji entities
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🧩 סקיל", callback_data=f"zip_route_skill:{token}"),
+                    InlineKeyboardButton("📦 גיבוי", callback_data=f"zip_route_backup:{token}"),
+                ]
+            ])
+
+            def _zip_prompt_text(icon: str) -> str:
+                return (
+                    f"{icon} קיבלתי קובץ ZIP: <code>{html_escape(original_name)}</code>\n"
+                    "איפה לשמור אותו?\n\n"
+                    "🧩 <b>בקטגוריית סקילים</b> — קטגוריה מיוחדת לשמירת סקילים בפורמט ZIP\n"
+                    "📦 <b>בקטגוריית גיבויים</b> — קטגוריה לשמירת Repo's מגיטהאב בפורמט ZIP "
+                    "(אפשר אחר כך לשחזר מהזיפ את כל הריפו בגיטהאב דרך הבוט - בלחיצה)"
+                )
+
+            try:
+                # אייקון ZIP מותאם (טלגרם פרימיום) — ה-ID מגיע מ-ENV בלבד; בלי ID נופלים ל-📁
+                custom_icon = tg_emoji(getattr(config, "CUSTOM_EMOJI_ZIP_ID", None), "📁")
+                try:
+                    await update.message.reply_text(
+                        _zip_prompt_text(custom_icon),
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except BadRequest:
+                    # טלגרם דחתה את ההודעה — אם זה בגלל האימוג'י המותאם (תנאי פרימיום/ID
+                    # שנמחק), שולחים שוב עם האימוג'י הרגיל: המשתמש חייב לקבל את ההודעה.
+                    if custom_icon == "📁":
+                        raise  # אין אימוג'י מותאם בהודעה — הכשל ממקור אחר, אין טעם בניסיון זהה
+                    await update.message.reply_text(
+                        _zip_prompt_text("📁"),
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    # מסמנים ומלוגגים רק אחרי שה-fallback עבר — זו ההוכחה שהבעיה הייתה
+                    # האימוג'י (BadRequest ממקור אחר היה מפיל גם את השליחה הזו ומתגלגל הלאה)
+                    global _custom_emoji_warned
+                    if not _custom_emoji_warned:
+                        _custom_emoji_warned = True
+                        logger.warning("האימוג'י המותאם (CUSTOM_EMOJI_ZIP_ID) נדחה ע\"י טלגרם — נופלים לאימוג'י רגיל")
+            except Exception:
+                # בלי כפתורים אין דרך לממש את הבחירה — מנקים את הרשומה והקובץ שנוצרו עבור ה-ZIP הזה
+                cleanup_pending_zip(path)
+                pending.pop(token, None)
+                raise
+            return True
         except Exception:
             pass
         return False

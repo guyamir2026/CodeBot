@@ -1,7 +1,7 @@
 (function(){
   const api = {
-    async listCollections() {
-      const r = await fetch('/api/collections');
+    async listCollections(archivedOnly) {
+      const r = await fetch('/api/collections' + (archivedOnly ? '?archived=1' : ''));
       return r.json();
     },
     async createCollection(payload){
@@ -211,6 +211,8 @@
   let currentCollectionId = '';
   let isBulkMode = false;
   let initialCollectionIdConsumed = false;
+  // מצב תצוגת הארכיון בסיידבר (false = אוספים רגילים; true = רק מאורכבים)
+  let showArchived = false;
   const WORKSPACE_STATE_META = {
     todo: { label: 'לטיפול', description: 'משימות שטרם התחלת', shortcut: 'Shift+1' },
     in_progress: { label: 'בתהליך', description: 'עבודה בתהליך', shortcut: 'Shift+2' },
@@ -1082,7 +1084,7 @@
     if (!root) return;
     root.innerHTML = '<div class="loading">טוען…</div>';
     try {
-      const data = await api.listCollections();
+      const data = await api.listCollections(showArchived);
       if (!data || !data.ok) throw new Error(data && data.error || 'שגיאה');
         const items = (data.collections || []).map((c) => {
           const iconChar = (ALLOWED_ICONS.includes(c.icon) ? c.icon : (ALLOWED_ICONS[0] || '📂')) || '📂';
@@ -1098,13 +1100,16 @@
         }).join('');
       root.innerHTML = `
         <div class="sidebar-header">
-          <div class="title">האוספים שלי</div>
-          <button id="createCollectionBtn" class="btn btn-secondary btn-icon" title="צור אוסף חדש">➕</button>
+          <div class="title">${showArchived ? '🗄️ ארכיון' : 'האוספים שלי'}</div>
+          <div class="sidebar-header__actions">
+            <button id="toggleArchivedBtn" class="btn btn-secondary btn-icon${showArchived ? ' is-active' : ''}" title="${showArchived ? 'חזרה לאוספים הפעילים' : 'הצג ארכיון'}" aria-label="${showArchived ? 'חזרה לאוספים הפעילים' : 'הצג ארכיון'}" aria-pressed="${showArchived ? 'true' : 'false'}">🗄️</button>
+            <button id="createCollectionBtn" class="btn btn-secondary btn-icon" title="צור אוסף חדש">➕</button>
+          </div>
         </div>
         <div class="sidebar-search">
           <input id="collectionsSearch" type="text" placeholder="חפש אוספים…"/>
         </div>
-        <div class="sidebar-list" id="collectionsList">${items || '<div class="empty">אין אוספים</div>'}</div>
+        <div class="sidebar-list" id="collectionsList">${items || `<div class="empty">${showArchived ? 'אין אוספים בארכיון' : 'אין אוספים'}</div>`}</div>
       `;
       wireSidebarHandlers(root);
       setupSidebarDropHandlers(root);
@@ -1281,6 +1286,41 @@
     });
   }
 
+  function openDescriptionModal(text){
+    // מודאל קריאה-בלבד להצגת תיאור הקובץ (דפוס .collection-modal הקיים)
+    if (document.querySelector('.collection-modal[data-modal="file-description"]')) return;
+    const overlay = document.createElement('div');
+    overlay.className = 'collection-modal';
+    overlay.setAttribute('data-modal', 'file-description');
+    overlay.innerHTML = `
+      <div class="collection-modal__backdrop"></div>
+      <div class="collection-modal__panel" role="dialog" aria-modal="true">
+        <h3 class="collection-modal__title">תיאור</h3>
+        <div class="collection-modal__field">
+          <p class="desc-modal__text"></p>
+        </div>
+        <div class="collection-modal__actions">
+          <button type="button" class="btn btn-secondary close">סגור</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    // textContent (לא innerHTML) — בטוח מ-XSS ושומר על התווים כפי שהם
+    const textEl = overlay.querySelector('.desc-modal__text');
+    if (textEl) textEl.textContent = String(text || '');
+    const backdrop = overlay.querySelector('.collection-modal__backdrop');
+    const closeBtn = overlay.querySelector('.close');
+    const cleanup = () => {
+      document.removeEventListener('keydown', onKeydown);
+      try { overlay.remove(); } catch (_e) { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); }
+    };
+    const onKeydown = (ev) => { if (ev.key === 'Escape') { ev.preventDefault(); cleanup(); } };
+    document.addEventListener('keydown', onKeydown);
+    if (backdrop) backdrop.addEventListener('click', cleanup);
+    if (closeBtn) closeBtn.addEventListener('click', cleanup);
+    requestAnimationFrame(() => { try { if (closeBtn) closeBtn.focus(); } catch (_e) {} });
+  }
+
   function openIconPicker(initialIcon){
     if (document.querySelector('.collection-modal[data-modal="icon-picker"]')) {
       return Promise.resolve(null);
@@ -1371,6 +1411,14 @@
       if (createBtn) {
         createBtn.addEventListener('click', () => {
           openCreateCollectionDialog();
+        });
+      }
+      // מעבר בין תצוגת אוספים רגילים לתצוגת ארכיון (רענון הרשימה מהשרת)
+      const toggleArchivedBtn = root.querySelector('#toggleArchivedBtn');
+      if (toggleArchivedBtn) {
+        toggleArchivedBtn.addEventListener('click', () => {
+          showArchived = !showArchived;
+          ensureCollectionsSidebar();
         });
       }
 
@@ -1862,6 +1910,9 @@
         <div class="actions">
           ${isWorkspace ? '' : '<button class="btn btn-secondary add-folder-btn" title="תיקיה חדשה">📁 תיקיה חדשה</button>'}
           <button class="btn btn-secondary rename">שנה שם</button>
+          ${isWorkspace ? '' : (col.is_archived
+            ? '<button class="btn btn-secondary unarchive" title="שחזר מארכיון">↩️ שחזר מארכיון</button>'
+            : '<button class="btn btn-secondary archive" title="העבר לארכיון">🗄️ ארכב</button>')}
           <button class="btn btn-danger delete">מחק</button>
         </div>
       </div>`;
@@ -2001,8 +2052,8 @@
       itemsContainer.querySelectorAll('.collection-cards').forEach(section => {
         wireDnd(section, collectionId);
       });
-      // Auto fit text for both old and new card styles
-      autoFitText('#collectionItems .collection-card__name', { minPx: 12, maxPx: 16, allowWrap: true });
+      // Auto fit text for both old and new card styles + מיקום אייקון התיאור (Slot 1 ליד השם / Slot 2 בשורת הכפתורים)
+      layoutDescIcons();
       autoFitText('#collectionItems .file', { minPx: 12, maxPx: 16 });
       const loadMoreBtn = container.querySelector('.load-more');
       if (loadMoreBtn) {
@@ -2033,6 +2084,24 @@
       ensureCollectionsSidebar();
       container.innerHTML = '<div class="empty">האוסף נמחק. הקבצים נשארים זמינים בבוט ובמסך הקבצים.</div>';
     });
+    // ארכוב/שחזור אוסף — מנצל את PUT הקיים דרך שדה is_archived (כמו is_favorite)
+    const archiveBtn = container.querySelector('.collection-header .archive');
+    const unarchiveBtn = container.querySelector('.collection-header .unarchive');
+    if (archiveBtn) archiveBtn.addEventListener('click', async () => {
+      if (!confirm('להעביר את האוסף לארכיון? הוא ייעלם מהרשימה אך יישמר, וניתן לשחזר אותו דרך 🗄️ "הצג ארכיון".')) return;
+      const res = await api.updateCollection(collectionId, { is_archived: true });
+      if (!res || !res.ok) return alert((res && res.error) || 'שגיאה בארכוב האוסף');
+      ensureCollectionsSidebar();
+      container.innerHTML = '<div class="empty">האוסף הועבר לארכיון. אפשר לשחזר אותו דרך 🗄️ "הצג ארכיון".</div>';
+    });
+    if (unarchiveBtn) unarchiveBtn.addEventListener('click', async () => {
+      const res = await api.updateCollection(collectionId, { is_archived: false });
+      if (!res || !res.ok) return alert((res && res.error) || 'שגיאה בשחזור מהארכיון');
+      // חוזרים לתצוגת האוספים הרגילים ומציגים את האוסף המשוחזר
+      showArchived = false;
+      ensureCollectionsSidebar();
+      await renderCollectionItems(collectionId);
+    });
 
     if (!isWorkspace && itemsContainer) {
       itemsContainer.addEventListener('click', async (ev) => {
@@ -2050,6 +2119,15 @@
             const currentTags = collectTagsFromElement(row);
             openTagsEditorModal(itemId, currentTags);
           }
+          return;
+        }
+
+        // הצגת תיאור הקובץ במודאל קטן (קריאה בלבד)
+        const descBtn = ev.target.closest('.desc-info');
+        if (descBtn) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          openDescriptionModal(descBtn.dataset.description || '');
           return;
         }
 
@@ -2239,13 +2317,23 @@
     if (!lower) return '';
     if (lower.endsWith('.md') || lower.endsWith('.markdown')) return 'md';
     if (lower.endsWith('.html') || lower.endsWith('.htm')) return 'html';
+    if (lower.endsWith('.svg')) return 'svg';
     return '';
   }
 
   function directViewTitle(mode){
     if (mode === 'md') return 'פתח תצוגת Markdown';
     if (mode === 'html') return 'פתח תצוגת דפדפן';
+    if (mode === 'svg') return 'פתח תצוגת SVG';
     return 'פתח תצוגה';
+  }
+
+  // הראוט שאליו נפתחת כל תצוגה ישירה, לפי המצב שנגזר מסיומת הקובץ
+  const DIRECT_VIEW_ROUTES = { md: '/md/', html: '/html/', svg: '/svg/' };
+
+  function directViewUrl(mode, fileId){
+    const prefix = DIRECT_VIEW_ROUTES[mode] || DIRECT_VIEW_ROUTES.html;
+    return `${prefix}${encodeURIComponent(fileId)}`;
   }
 
   async function handleDirectViewClick(row, button, rawName){
@@ -2291,11 +2379,8 @@
       return;
     }
 
-    const url = (mode === 'md')
-      ? `/md/${encodeURIComponent(fileId)}`
-      : `/html/${encodeURIComponent(fileId)}`;
     // דרישת UX: לפתוח באותו טאב (לא בכרטיסייה חדשה)
-    window.location.href = url;
+    window.location.href = directViewUrl(mode, fileId);
   }
 
   // פתיחת קובץ לפי שם הקובץ (שימושי גם ללחיצה על כל השורה)
@@ -2819,8 +2904,11 @@
           ${selectBox}
           <span class="collection-card__drag">⋮⋮</span>
           <div class="collection-card__body">
-            <div class="collection-card__name">
-              <a class="collection-card__link" href="#" draggable="false" data-open="${escapeHtml(fileName)}">${escapeHtml(fileName)}</a>
+            <div class="collection-card__title-row">
+              <div class="collection-card__name">
+                <a class="collection-card__link" href="#" draggable="false" data-open="${escapeHtml(fileName)}">${escapeHtml(fileName)}</a>
+              </div>
+              ${item.description ? `<button type="button" class="desc-info" data-description="${escapeHtml(item.description)}" title="הצג תיאור" aria-label="הצג תיאור">ℹ️</button>` : ''}
             </div>
             <div class="collection-card__meta">
               ${tagsHtml}
@@ -3494,6 +3582,42 @@
     } catch(_e){ /* ignore */ }
   }
 
+  // מיקום אייקון התיאור בכרטיס אוסף: ברירת מחדל ליד השם (Slot 1); ואם השם ארוך
+  // ונשבר לשתי שורות — אין מקום בשורת השם, אז האייקון "קופץ" לשורת 4 הכפתורים,
+  // משמאל להם (RTL ⇒ ילד אחרון), עם רווח קטן (Slot 2). מנצל את זיהוי ה-is-wrapped
+  // של autoFitText, ולכן מודד את השם *ליד* האייקון (sibling ב-flex).
+  function layoutDescIcons(){
+    try {
+      const cards = document.querySelectorAll('#collectionItems .collection-card');
+      if (!cards || !cards.length) return;
+      // שלב 1: reset — כל אייקון חוזר ל-Slot 1 (מיד אחרי השם, בתוך ה-title-row)
+      cards.forEach((card) => {
+        const icon = card.querySelector('.desc-info');
+        const titleRow = card.querySelector('.collection-card__title-row');
+        if (icon && titleRow && icon.parentElement !== titleRow) {
+          titleRow.appendChild(icon);
+        }
+      });
+      // שלב 2: התאמת גודל השם — מודד את הרוחב שנשאר *ליד* האייקון (הוא sibling ב-flex)
+      autoFitText('#collectionItems .collection-card__name', { minPx: 12, maxPx: 16, allowWrap: true });
+      // שלב 3: שם שנשבר לשתי שורות ⇒ אין מקום ⇒ האייקון עובר לשורת הכפתורים (ילד אחרון)
+      let moved = false;
+      cards.forEach((card) => {
+        const name = card.querySelector('.collection-card__name');
+        const icon = card.querySelector('.desc-info');
+        const actions = card.querySelector('.collection-card__actions');
+        if (name && icon && actions && name.classList.contains('is-wrapped')) {
+          actions.appendChild(icon);
+          moved = true;
+        }
+      });
+      // רה-פיט לשמות שהאייקון עזב (עכשיו ברוחב מלא) — רק אם באמת הזזנו משהו
+      if (moved) {
+        autoFitText('#collectionItems .collection-card__name', { minPx: 12, maxPx: 16, allowWrap: true });
+      }
+    } catch (_e) { /* ignore */ }
+  }
+
   // תזמון/חסימה של ארועי resize כדי לא להציף חישובים
   function debounce(fn, wait){
     let t = null;
@@ -3517,7 +3641,7 @@
   // עדכון אוטומטי בהתאמת חלון
   const onResize = throttle(() => {
     autoFitText('#collectionItems .file', { minPx: 12, maxPx: 16 });
-    autoFitText('#collectionItems .collection-card__name', { minPx: 12, maxPx: 16, allowWrap: true });
+    layoutDescIcons();
     autoFitText('#collectionsSidebar .sidebar-item .name', { minPx: 12, maxPx: 16 });
     autoFitText('.workspace-card__name', { minPx: 12, maxPx: 16, allowWrap: true });
   }, 150);

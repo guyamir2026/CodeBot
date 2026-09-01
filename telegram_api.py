@@ -1,6 +1,241 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Optional
+
+# מבנה טוקן של בוט טלגרם: מזהה מספרי, נקודתיים, ואז סוד באורך ~35 תווים.
+# כתובות ה-API נבנות כ-https://api.telegram.org/bot<TOKEN>/method — ולכן כל טקסט
+# שנגזר מכתובת כזו (הודעת שגיאה, לוג, אירוע Sentry) עלול לשאת את הטוקן במלואו.
+# דרישת 30+ תווים בסוד מצמצמת פגיעה בטקסטים לגיטימיים (hash/מזהה עם נקודתיים),
+# ועדיין תופסת כל טוקן אמיתי.
+_BOT_TOKEN_RE = re.compile(r"\d{5,16}:[A-Za-z0-9_-]{30,}")
+
+# השם הציבורי של הדפוס — צרכנים חיצוניים (כמו SensitiveDataFilter) מייבאים
+# אותו מכאן, כדי שלא יהיו שני מקורות אמת לדפוס רגיש-אבטחה
+BOT_TOKEN_RE = _BOT_TOKEN_RE
+
+TOKEN_PLACEHOLDER = "<REDACTED>"
+
+#: סוד שרוכב על שורת שאילתה — **לפי שם הפרמטר, לא לפי צורת הערך.**
+#:
+#: זה מה שהבדיל בין הטוקן של טלגרם, שנתפס, לבין מפתח Gemini, שדלף במלואו:
+#: הרשת הכירה צורות של סודות מוכרים, ולכן כל ספק חדש היה דליפה חדשה עד
+#: שמישהו נזכר להוסיף רג'קס. הכלל הזה אינו יודע דבר על Google, על OpenAI
+#: או על מי שיבוא אחריהם — הוא מנקה לפי **שם** הפרמטר, ולכן עובד לכולם.
+#:
+#: **מעוגן ל-``?``/``&`` או לתחילת מחרוזת — ושני החלקים נדרשים.**
+#: אינטגרציית httpx של Sentry לא שומרת את השאילתה בתוך ה-URL אלא בשדה
+#: נפרד, ``http.query``, שערכו מחרוזת עירומה: ``key=AIza...`` בלי ``?``
+#: מוביל. עיגון ל-``?``/``&`` בלבד היה מפספס בדיוק את השדה שדלף — זה נתפס
+#: באימות מול מבנה ה-span האמיתי, לא בקריאת הקוד.
+#:
+#: ותחילת-מחרוזת בלבד, לא רווח: לוגים לגיטימיים נושאים ``key=`` באמצע שורה
+#: בלי קשר לסודות (``embedding_worker`` מדפיס ``key=%s`` על מפתח מודל/מימד),
+#: והרחבה לרווח הייתה מסרסת מידע אבחוני בלי להוסיף הגנה.
+#:
+#: **התחילית היא מה שמונע רשימה מתארכת.** בלעדיה ``auth_token``,
+#: ``oauth_token``, ``id_token``, ``private_key``, ``x-api-key`` ו-
+#: ``session_token`` היו כולם דולפים — שמות פרמטרים נפוצים לגמרי ב-OAuth
+#: ובקולבקים. פתרון של "נוסיף גם אותם לרשימה" היה משחזר בדיוק את התקלה
+#: שהכלל הזה בא לחסל: רשימה שחורה שמתעדכנת רק אחרי דליפה.
+#:
+#: **רצף ספרות הוא מפריד מקטע בפני עצמו.** ``v2token`` נקרא ``v2`` +
+#: ``token`` לכל קורא, בדיוק כמו ``v2Token`` — ואותו credential יכול לשבת
+#: בשניהם. לכן המעבר ספרה ← אות הוא גבול שלישי, לצד המפריד ו-camelCase.
+#: זה גם מה שמפריד אותו מגבול אות ← אות, שהיה תופס את ``monkey``:
+#: ``mon`` + ``key`` אינה קריאה טבעית של השם, ``v2`` + ``token`` כן.
+#:
+#: התחילית מסתיימת במפריד (``_``, ``-``, ``.``), בגבול camelCase, או
+#: במעבר ספרה ← אות;
+#: ולכן ``privateKey``, ``authToken`` ו-``xApiKey`` נתפסים כמו המקבילות
+#: עם קו תחתון. הגבול חייב להיות רגיש-רישיות (``(?-i:...)``): תחת ``(?i)``
+#: הכולל, ``[A-Z]`` תופס גם אותיות קטנות, והגבול היה מתדרדר ל"בין כל שתי
+#: אותיות" — מה שהיה מנקה גם ``?monkey=``. נתפס באימות, לא בקריאה.
+#:
+#: ``?monkey=`` ו-``?key_id=`` **אינם** נתפסים: המילה הרגישה חייבת להיות
+#: מקטע שלם, לא סיומת מקרית ולא תחילית של שם אחר. יש טסט שנועל את שניהם.
+#:
+#: **ניקוי-היתר מכוון.** ``?search_key=``, ``?page_key=`` ו-``?sort_token=``
+#: כן ינוקו, למרות שאינם סודות — לפי **שם** אי אפשר להבחין ביניהם לבין
+#: ``?private_key=``, ולכן הבחירה היא בין ניקוי-יתר של ערך אבחוני לבין
+#: דליפת credential. ברשת של לוגים ו-Sentry הכיוון הנכון הוא fail-closed.
+#: לשם השוואה: ``sanitize_url`` של Sentry עצמו מנקה **כל** ערך בשאילתה,
+#: כולל ``limit=5``; הכלל כאן כבר צר ממנו משמעותית.
+_SECRET_QUERY_PARAM_RE = re.compile(
+    r"(?i)((?:^|[?&])"
+    r"(?:[A-Za-z0-9_.\-]*(?:[_.\-]"
+    r"|(?<=(?-i:[a-z0-9]))(?=(?-i:[A-Z]))"
+    r"|(?<=[0-9])(?=(?-i:[A-Za-z]))))?"
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret"
+    r"|authorization|signature|password|passwd|secret|token|auth|pwd|key|sig)=)"
+    r"[^&#\s\"\'<>\\]+"
+)
+SECRET_QUERY_PARAM_RE = _SECRET_QUERY_PARAM_RE
+
+#: **רשימת הדפוסים המשותפת.** ``SensitiveDataFilter`` בלוגים מייבא אותה
+#: מכאן, כדי שהוספת דפוס תגיע לשתי הרשתות — Sentry והלוגים — בבת אחת.
+#: כשהיה מקור אמת אחד לכל רשת, אחת מהן קיבלה תיקון והשנייה נשארה מאחור.
+REDACTION_PATTERNS = [
+    (_BOT_TOKEN_RE, TOKEN_PLACEHOLDER),
+    (_SECRET_QUERY_PARAM_RE, r"\1" + TOKEN_PLACEHOLDER),
+]
+
+
+def _scrub_text(text: str) -> str:
+    """מריץ את כל דפוסי הניקוי על מחרוזת אחת, לפי הסדר."""
+    for pattern, replacement in REDACTION_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _has_secret(text: str) -> bool:
+    """האם המחרוזת נושאת סוד לפי אחד הדפוסים."""
+    return any(pattern.search(text) for pattern, _ in REDACTION_PATTERNS)
+
+# מוחזר כשאי אפשר לנקות ערך (str() נכשל) — עדיף לאבד את הערך מאשר להדליף טוקן
+UNREDACTABLE_PLACEHOLDER = "<UNREDACTABLE>"
+
+
+def redact_bot_token(value: Any) -> Any:
+    """מחליף כל סוד שמופיע בטקסט בסימון ``<REDACTED>``.
+
+    **השם היסטורי.** הפונקציה נולדה לטוקן של טלגרם, והיום היא מריצה את כל
+    :data:`REDACTION_PATTERNS` — טוקן הבוט **וגם** סוד שרוכב על שורת שאילתה.
+    ההרחבה נעשתה אחרי שמפתח Gemini דלף במלואו ל-Sentry: הוא עבר דרך אותה
+    פונקציה בדיוק, ויצא ממנה כמו שנכנס, כי הרשימה הייתה בגודל אחד.
+
+    מחזיר ``None`` כפי שהוא, וכל ערך אחר מומר למחרוזת מנוקה. אם ההמרה למחרוזת
+    נכשלת מוחזר ``<UNREDACTABLE>`` — כישלון ניקוי לעולם לא מחזיר את הערך הגולמי.
+    זו נקודת הניקוי היחידה בקוד — ``TelegramAPIError``, מסנני ה-Sentry ומסנן
+    הלוגים נשענים עליה.
+    """
+    if value is None:
+        return None
+    try:
+        text = value if isinstance(value, str) else str(value)
+        return _scrub_text(text)
+    except Exception:
+        return UNREDACTABLE_PLACEHOLDER
+
+
+def _redact_bytes(obj: Any) -> Any:
+    """מנקה טוקן מ-bytes/bytearray תוך שמירה על הטיפוס המקורי."""
+    try:
+        cleaned_text = _scrub_text(obj.decode("utf-8", errors="replace"))
+        encoded = cleaned_text.encode("utf-8")
+        return bytearray(encoded) if isinstance(obj, bytearray) else encoded
+    except Exception:
+        return UNREDACTABLE_PLACEHOLDER
+
+
+def _dedupe_key(ck: Any, cleaned_dict: Dict[Any, Any]) -> Any:
+    """ממספר מפתח שמתנגש עם מפתח קיים אחרי ניקוי (‎#2 למחרוזת, ‎(key, 2)‎ לאחרים).
+
+    שני מפתחות שונים יכולים להתנקות לאותו ערך (שתי כתובות עם טוקנים שונים);
+    דריסה שקטה מאבדת שדה אבחוני — במקום זה המאוחר מקבל סיומת מספור.
+    """
+    if ck not in cleaned_dict:
+        return ck
+    n = 2
+    candidate = f"{ck}#{n}" if isinstance(ck, str) else (ck, n)
+    while candidate in cleaned_dict:
+        n += 1
+        candidate = f"{ck}#{n}" if isinstance(ck, str) else (ck, n)
+    return candidate
+
+
+def _redact_dict(obj: Dict[Any, Any], _memo: Dict[int, Any], _depth: int) -> Dict[Any, Any]:
+    cleaned_dict: Dict[Any, Any] = {}
+    # רישום לפני המילוי — כך הפניה מעגלית חוזרת לעותק המנוקה ולא למקור
+    _memo[id(obj)] = cleaned_dict
+    for k, v in obj.items():
+        # גם מפתח יכול לשאת טוקן — כמחרוזת או בתוך tuple/frozenset (שנשארים hashable)
+        ck = _dedupe_key(redact_bot_token_deep(k, _memo, _depth + 1), cleaned_dict)
+        cleaned_dict[ck] = redact_bot_token_deep(v, _memo, _depth + 1)
+    return cleaned_dict
+
+
+def _redact_list(obj: list, _memo: Dict[int, Any], _depth: int) -> list:
+    cleaned_list: list = []
+    _memo[id(obj)] = cleaned_list
+    for v in obj:
+        cleaned_list.append(redact_bot_token_deep(v, _memo, _depth + 1))
+    return cleaned_list
+
+
+def _redact_tuple(obj: tuple, _memo: Dict[int, Any], _depth: int) -> tuple:
+    cleaned_items = [redact_bot_token_deep(v, _memo, _depth + 1) for v in obj]
+    try:
+        if hasattr(obj, "_fields"):  # namedtuple — בנייה מאיברים בודדים
+            return type(obj)(*cleaned_items)
+        return type(obj)(cleaned_items)
+    except Exception:
+        # תת-מחלקה עם בנאי לא סטנדרטי — tuple רגיל עדיף על אובייקט לא מנוקה
+        return tuple(cleaned_items)
+
+
+def redact_bot_token_deep(obj: Any, _memo: Optional[Dict[int, Any]] = None, _depth: int = 0) -> Any:
+    """מנקה טוקנים מכל המחרוזות בתוך מבנה נתונים מקונן.
+
+    נועד למסנני Sentry: אירוע שגיאה פורש את הטוקן על פני כמה שדות (גוף החריגה,
+    הודעת הלוג, breadcrumbs), ורשימת שדות קבועה תמיד תפספס אחד. במקום זה עוברים
+    על כל המבנה — dict (כולל מפתחות), list, tuple (כולל namedtuple), set ו-frozenset.
+
+    מבנים מעגליים מטופלים ב-memo לפי ‎id()‎ כך שכל צומת מנוקה בדיוק פעם אחת;
+    מגבלת העומק היא רשת ביטחון בלבד, וחצייה שלה מחזירה placeholder — לעולם לא
+    את הערך המקורי.
+    """
+    if _memo is None:
+        _memo = {}
+    if _depth > 100:
+        # עומק כזה לא קיים באירועי Sentry אמיתיים; מחזירים placeholder ולא את המקור
+        return UNREDACTABLE_PLACEHOLDER
+    if isinstance(obj, str):
+        return redact_bot_token(obj)
+    if isinstance(obj, (bytes, bytearray)):
+        return _redact_bytes(obj)
+    if isinstance(obj, (dict, list)):
+        existing = _memo.get(id(obj))
+        if existing is not None:
+            return existing
+        if isinstance(obj, dict):
+            return _redact_dict(obj, _memo, _depth)
+        return _redact_list(obj, _memo, _depth)
+    if isinstance(obj, tuple):
+        return _redact_tuple(obj, _memo, _depth)
+    if isinstance(obj, (set, frozenset)):
+        cleaned_set = {redact_bot_token_deep(v, _memo, _depth + 1) for v in obj}
+        return frozenset(cleaned_set) if isinstance(obj, frozenset) else cleaned_set
+    # סקלרים חסרי טקסט — אין מה לנקות בהם
+    if obj is None or isinstance(obj, (int, float, bool)):
+        return obj
+    # אובייקט זר (למשל מופע חריגה בתוך hint/extra): Sentry ימיר אותו למחרוזת
+    # אחרי שהניקוי כבר עבר — ב-repr() עבור אובייקטים שאינם JSON — ולכן בודקים
+    # את שני הייצוגים. אם אחד מהם נושא טוקן, מחזירים את הייצוג המנוקה במקום
+    # האובייקט. אובייקט נקי בשניהם נשמר כמות שהוא.
+    try:
+        text = str(obj)
+        rep = repr(obj)
+    except Exception:
+        return UNREDACTABLE_PLACEHOLDER
+    if _has_secret(rep):
+        return _scrub_text(rep)
+    if _has_secret(text):
+        return _scrub_text(text)
+    return obj
+
+
+def scrub_sentry_event(event: Any) -> Any:
+    """מנקה אירוע Sentry שלם לפני שליחה; מחזיר ``None`` אם הניקוי נכשל.
+
+    נקודת האמת המשותפת לכל ה-hooks — ``before_send`` וגם
+    ``before_send_transaction``, בבוט ובוובאפ. מדיניות fail-closed: אירוע
+    שהניקוי שלו נכשל לא נשלח גולמי; הקורא אחראי רק לרשום אזהרה כשמוחזר None.
+    """
+    try:
+        return redact_bot_token_deep(event)
+    except Exception:
+        return None
 
 
 def _truncate(text: Any, limit: int = 800) -> str:
@@ -27,10 +262,13 @@ class TelegramAPIError(RuntimeError):
         payload: Any = None,
     ) -> None:
         self.error_code = error_code
-        self.description = str(description or "").strip()
-        self.url = url
+        # ניקוי הטוקן כבר כאן, לפני ההשמה: כך גם ``self.url``/``self.description``
+        # וגם טקסט החריגה נקיים, ולא משנה מי יקרא אותם או ירשום אותם ללוג.
+        self.description = redact_bot_token(str(description or "").strip())
+        self.url = redact_bot_token(url)
         self.http_status = http_status
-        self.payload = payload
+        # ניקוי עמוק — גם dict/list (למשל payload מלא של תגובת טלגרם) חייבים לצאת נקיים
+        self.payload = redact_bot_token_deep(payload) if payload is not None else None
         msg = f"Telegram API error"
         if error_code is not None:
             msg += f" error_code={error_code}"
@@ -38,8 +276,8 @@ class TelegramAPIError(RuntimeError):
             msg += f" description={self.description}"
         if http_status is not None:
             msg += f" http_status={http_status}"
-        if url:
-            msg += f" url={url}"
+        if self.url:
+            msg += f" url={self.url}"
         super().__init__(msg)
 
 

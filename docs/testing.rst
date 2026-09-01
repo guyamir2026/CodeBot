@@ -1,5 +1,6 @@
 Testing Guide
 =============
+:summary: Quickstart להרצת טסטים, ההנחיות הקריטיות, טעינת ה-stubs לטלגרם, עבודה עם tmp_path ומתכון מחיקה מוגבל ל-allowlist, ו-mocking של HTTP.
 
 🚀 Quickstart לטסטים
 --------------------
@@ -72,7 +73,7 @@ Testing Guide
    def safe_rmtree(path: Path, allow_under: Path) -> None:
        p = path.resolve()
        base = allow_under.resolve()
-       if not str(p).startswith(str(base)) or p in (Path('/'), base.parent, Path.cwd()):
+       if not (p == base or base in p.parents) or p in (Path('/'), base.parent, Path.cwd()):
            raise RuntimeError(f"Refusing to delete unsafe path: {p}")
        shutil.rmtree(p)
 
@@ -155,6 +156,34 @@ Mocking HTTP ב‑github_menu_handler
        enabled = True  # הפיצ'ר נכפה ל-True בזמן טסטים
 
 
+בדיקות מול מונגו אמיתי
+------------------------
+
+רוב הבדיקות בריפו רצות מול stub בפייתון טהור, וזה נכון: הן מהירות, אין להן תלות חיצונית, והן מכסות ניתוב, ולידציה, סדר פעולות וקודי שגיאה.
+
+אבל יש דברים שסטאב **לא יכול** לבדוק — לא כי הוא חלש, אלא כי הם אינם בקוד אלא בהתנהגות של המסד:
+
+- **אילוץ ייחודיות** — אינדקס ייחודי-חלקי כמו ``one_default_per_user`` הוא מה שסוגר מרוץ בין שתי בקשות מקבילות. רק המסד יכול לדחות, ו-``create_index`` שהחזיר בלי לזרוק אינו ראיה שהאינדקס נוצר.
+- **האם אינדקס בשימוש** — רק ``explain`` עונה. סטאב מחזיר תוצאה נכונה גם כששאילתה סורקת את כל האוסף.
+- **סמנטיקה של BSON** — ``datetime`` נקטם למילישניות, ובלי ``tz_aware=True`` הוא חוזר נאיבי. השוואה בין נאיבי ל-aware זורקת ``TypeError``, ואם היא עטופה ב-``except`` — הבדיקה שנשענת עליה מפסיקה לרוץ בשקט.
+- **צינורות aggregation** — סטאב שנכתב ביד מבין רק את הצורה שנכתבה בו, ולכן שגיאת תחביר אמיתית עוברת אצלו.
+
+הבדיקות האלה חיות ב-``tests/test_note_boards_mongo.py``. הן **מדלגות** כשאין ``MONGODB_URL`` או כשהשרת אינו נגיש, כך שהרצה מקומית רגילה נשארת מהירה. אותו דילוג-על-שרת-לא-נגיש קיים גם בפיקסצ'ר ``wired_mongo`` שב-``tests/conftest.py``, ומשרת את הבדיקות שמריצות את הראוטים של הוובאפ מול מסד אמיתי.
+
+.. warning::
+   **הן אינן רצות ב-CI כרגע.** הג'וב ``Unit Tests`` אמנם מרים ``mongo:6.0`` כשירות, אבל הוא ``runs-on: ubuntu-latest`` **בלי** ``container:``, והשירות מוגדר **בלי** ``ports:``. לפי `תיעוד GitHub Actions <https://docs.github.com/en/actions/using-containerized-services/about-service-containers>`_, גישה לפי שם השירות עובדת רק כשהג'וב עצמו רץ בקונטיינר; אחרת צריך למפות פורטים ולפנות ל-``127.0.0.1:<port>``. בלי זה המארח ``mongodb`` אינו נפתר כלל (``[Errno -3] Temporary failure in name resolution``), והבדיקות מדלגות בשקט.
+
+   התיקון הוא ``ports:`` על השירות ומעבר ל-``127.0.0.1`` — בדיוק כפי שהג'וב ``alembic-migrations`` באותו קובץ כבר עושה עבור postgres. הוא מוצא לסבב נפרד, כי הוא **יעיר** את הבדיקות האלה ואי אפשר לדעת מראש אילו מהן עוברות.
+
+להרצה מקומית מול שרת אמיתי:
+
+.. code-block:: bash
+
+   MONGODB_URL='mongodb://127.0.0.1:27017' pytest tests/test_note_boards_mongo.py -v
+
+.. warning::
+   כל הרצה יוצרת מסד עם שם ייחודי משלה (תחילית ``codebot_notes_it_``), וה-teardown מוודא שהשם תואם לתחילית **לפני** ``drop_database``. אל תכוונו את ``MONGODB_URL`` למסד שיש בו נתונים אמיתיים.
+
 כיסוי בדיקות (pytest-cov)
 --------------------------
 
@@ -207,5 +236,10 @@ CI נתמך
 קישורים
 -------
 
-- :doc:`ci-cd`
-- :doc:`ai-guidelines`
+העמוד הזה הוא נקודת הכניסה לטסטים, ולכן הוא מפנה גם לעמודים שנוגעים בטסטים מזוויות אחרות, כך שמי שהגיע לכאן ראשון יוכל למצוא אותם בקלות.
+
+- :doc:`troubleshooting` – שגיאות ייבוא בזמן טסטים, בעיות event loop של asyncio, וכלים לדיבוג מהיר.
+- :doc:`performance-tests` – ``pytest -m performance``: איך להריץ בבטחה, מה מסומן כקל ומה כבד, ואיפה נשמרים זמני הריצה.
+- :doc:`testing-rate-limit-examples` – קטעי דוגמה לכתיבת טסטים ל-Rate Limiting מול Redis.
+- :doc:`ci-cd` – אילו ג'ובים רצים על PR, ומה הסטטוסים הנדרשים.
+- :doc:`ai-guidelines` – ההנחיות לסוכנים שעובדים בריפו; בפרק הטסטים: ``tmp_path`` בלבד לכל IO, ו-``safe_rmtree`` למחיקות.

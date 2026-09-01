@@ -20,10 +20,14 @@ import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
-from zoneinfo import ZoneInfo
 
 from flask import Blueprint, jsonify, redirect, render_template, request, session, url_for
 from pymongo import DESCENDING
+
+from utils import TimeUtils
+
+# ייבוא ישיר ולא דרך _get_app_helpers: המודול עצמאי ואינו יוצר תלות מעגלית
+from webapp.admin_repos import load_admin_repos
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +49,15 @@ def _get_app_helpers():
         _load_whats_new,
         _MIN_DT,
         BOT_USERNAME_CLEAN,
+        format_datetime_display,
         format_file_size,
         get_db,
         get_language_icon,
         is_admin,
         is_impersonating_safe,
         is_premium,
+        lang_icon,
+        LANG_ICON_SIZES,
         resolve_file_language,
     )
 
@@ -59,8 +66,11 @@ def _get_app_helpers():
         is_premium=is_premium,
         is_impersonating_safe=is_impersonating_safe,
         get_db=get_db,
+        format_datetime_display=format_datetime_display,
         format_file_size=format_file_size,
         get_language_icon=get_language_icon,
+        lang_icon=lang_icon,
+        LANG_ICON_SIZES=LANG_ICON_SIZES,
         resolve_file_language=resolve_file_language,
         _build_activity_timeline=_build_activity_timeline,
         _build_push_card=_build_push_card,
@@ -155,8 +165,8 @@ def dashboard():
             file["language"] = language
             file["icon"] = helpers.get_language_icon(language)
             if "created_at" in file:
-                file["created_at_formatted"] = file["created_at"].strftime(
-                    "%d/%m/%Y %H:%M"
+                file["created_at_formatted"] = helpers.format_datetime_display(
+                    file["created_at"]
                 )
 
         stats = {
@@ -228,10 +238,9 @@ def dashboard():
                             local_dt = None
                             try:
                                 normalized = raw_date.replace("Z", "+00:00")
-                                parsed = datetime.fromisoformat(normalized)
-                                if parsed.tzinfo is None:
-                                    parsed = parsed.replace(tzinfo=timezone.utc)
-                                local_dt = parsed.astimezone(ZoneInfo("Asia/Jerusalem"))
+                                local_dt = TimeUtils.to_israel_time(
+                                    datetime.fromisoformat(normalized)
+                                )
                             except Exception:
                                 local_dt = None
                             if local_dt is not None:
@@ -247,6 +256,9 @@ def dashboard():
         push_card = helpers._build_push_card(db, user_id)
         notes_snapshot = helpers._build_notes_snapshot(db, user_id)
         whats_new = helpers._load_whats_new(limit=5)
+
+        # רשימת הריפוים נטענת רק לאדמין, כך שהיא לא מגיעה כלל ל-HTML של משתמש רגיל
+        admin_repos = load_admin_repos() if user_is_admin else []
 
         # Widget: files that need attention
         dismissed_ids = helpers._get_active_dismissals(db, user_id)
@@ -266,6 +278,7 @@ def dashboard():
             push_card=push_card,
             notes_snapshot=notes_snapshot,
             whats_new=whats_new,
+            admin_repos=admin_repos,
             files_need_attention=files_need_attention,
             bot_username=helpers.BOT_USERNAME_CLEAN,
             pinned_files=pinned_data,
@@ -324,6 +337,7 @@ def dashboard():
             push_card=fallback_card,
             notes_snapshot=fallback_notes,
             whats_new={"features": [], "has_features": False, "total": 0},
+            admin_repos=[],
             files_need_attention=fallback_attention,
             error="אירעה שגיאה בטעינת הנתונים. אנא נסה שוב.",
             bot_username=helpers.BOT_USERNAME_CLEAN,
@@ -500,7 +514,8 @@ def api_dashboard_activity_files():
                 title=title,
                 subtitle=subtitle,
                 dt=dt,
-                icon=helpers.get_language_icon(language),
+                icon=helpers.lang_icon(language, helpers.LANG_ICON_SIZES["timeline"]),
+                icon_lang=language,
                 badge=file_badge,
                 badge_variant="code",
                 href=href,

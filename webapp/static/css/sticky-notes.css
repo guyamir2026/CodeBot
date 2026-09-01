@@ -1,5 +1,28 @@
 /* Sticky Notes styles */
+/* דיו הפתק — **קבוע, ולא של הערכה.**
+ *
+ * רקע הפתק הוא צהוב קשיח שאינו משתנה עם הערכה, ולכן כל צבע טקסט שיירש
+ * מהערכה יוצא שגוי בדיוק באותה מידה שהרקע לא השתנה. נמדד: שם הפתק הגיע
+ * לניגודיות 1.03:1 ב-classic ו-ocean (לבן על צהוב בהיר — בלתי נראה),
+ * 1.18–1.50 בשאר הכהות, ורק בערכה הבהירה היחידה הוא היה קריא.
+ *
+ * הגוון אינו המצאה: הוא ``editor.foreground`` של ערכת ``Pen Paper Coffee``,
+ * שהיא הערכה היחידה שבה השם נראה טוב — ובדיוק מהסיבה הזו. הרצת הפרסר
+ * האמיתי (``services/theme_parser_service.parse_vscode_theme``) על ה-JSON
+ * שלה מראה ש-``editor.foreground: #2b3f6a`` הופך ל-``--text-primary``,
+ * וזה מה שהשם ירש שם. כחול דיו של עט על נייר — 10.10:1 מול צהוב הפתק,
+ * הרבה מעל הסף המחמיר של WCAG AAA (7:1).
+ *
+ * (``--text-secondary`` בערכה הזו הוא דווקא ``#616161``, נפילה גנרית — אין
+ * לה ``sideBar.foreground`` כלל. כלומר לא הוא זה שנראה טוב.)
+ *
+ * ``--note-ink-muted`` הוא לפקד שאינו זמין, באותה משפחת גוון. 4.00:1 —
+ * מעל הסף לרכיבי ממשק (1.4.11) עם מרווח, כלומר **נראה**, אבל חלש דיו
+ * כדי לומר "אי אפשר ללחוץ".
+ */
 .sticky-note{
+  --note-ink: #2b3f6a;
+  --note-ink-muted: #66739A;
   position: fixed;
   z-index: 950;
   box-shadow: 0 8px 20px rgba(0,0,0,.25);
@@ -15,17 +38,55 @@
 .sticky-note.is-floating{
   position: fixed;
 }
+/* הפתק הוא עמודת flex: כותרת בגובה טבעי, וגוף שממלא את השאר.
+ *
+ * זה מה שמוציא מהמשוואה את המספר הקסום 42. עד היום הכותרת **חויבה**
+ * להישאר בגובה קבוע, כי גוף הפתק חושב כ-``calc(100% - 42px)`` והמיזעור
+ * נקבע כ-``height: 42px``. כלומר כל שינוי בכותרת — כפתור נוסף, שורה
+ * שנשברת — היה חותך את הגוף בשקט. עכשיו הגובה נגזר מהתוכן. */
+.sticky-note{ display:flex; flex-direction: column; }
 .sticky-note.is-minimized .sticky-note-content{ display:none; }
-.sticky-note.is-minimized{ height: 42px !important; }
+/* ``height: auto`` דורס את ה-``style.height`` שנשמר, ולכן פתק ממוזער
+   מתכווץ בדיוק לגובה הכותרת שלו — שורה אחת או שתיים, לפי מה שנכנס. */
+.sticky-note.is-minimized{ height: auto !important; }
 
 .sticky-note-header{
   display:flex; align-items:center; justify-content:space-between;
   padding: 6px 8px; cursor: move; user-select:none;
   background: rgba(0,0,0,.06);
+  flex: 0 0 auto;
+  /* גלישה לשורה שנייה כשאין מקום. ראו את ההסבר אצל ``.sticky-note-title``
+     — זה מה שמאפשר לשם ולשישה כפתורים לחיות יחד בפתק של 200 פיקסלים. */
+  flex-wrap: wrap;
 }
-.sticky-note-drag{ width: 100%; height: 16px; cursor: move; touch-action: none; }
-.sticky-note-actions{ display:flex; gap:6px; }
-.sticky-note-btn{ border:none; background: transparent; cursor: pointer; font-size: 16px; transition: background-color .18s ease, color .18s ease; }
+/* **אין כאן ``touch-action`` על ``.sticky-note-header``, וזו החלטה.**
+   הכותרת כולה היא ידית הגרירה, ולכאורה מתבקש ``touch-action: none``
+   עליה — אבל אסור.
+
+   ``touch-action`` **נחתכת עם האבות**: התנהגות מותרת רק אם היא מותרת
+   בכל אלמנט בשרשרת עד מיכל הגלילה. נמדד בכרומיום בקלט מגע דרך CDP —
+   אב ``none`` עם צאצא ``auto``: לא גלל; אותו אב עם ``manipulation``
+   בצאצא: לא גלל; בקרה auto/auto: גללה 195px. כלומר ``none`` על הכותרת
+   הוא גזר דין על כל מה שבתוכה, ואי אפשר להחזיר ממנו כפתור או שדה.
+   בפרט הוא מבטל בשקט את ``.is-editing-title .sticky-note-drag`` שלמטה —
+   הכלל שמחזיר מגע לשדה השם בעריכה, שכבר תוקן פעם בעבר.
+
+   מה שכן חוסם את הגלילה בגרירה מהכותרת: ``e.preventDefault()`` שכבר
+   קיים ב-``onDown`` של ``_enableDrag``, על ה-``touchstart``, במאזין
+   ``{ passive: false }``. הוא מדויק יותר מ-CSS דווקא כי הוא רץ **אחרי**
+   ``_isDragExempt`` — כלומר כפתור ושדה-שם-בעריכה לא מגיעים אליו כלל
+   ושומרים על התנהגות המגע המקורית שלהם. נמדד: החלקה מהשטח הריק בכותרת
+   הזיזה את הפתק ולא גללה (scrollY=0), והחלקה מכפתור גללה 472px.
+
+   ``.sticky-note-drag`` כן מקבל ``none`` — הוא אינו אב של אף כפתור,
+   והכלל שלמטה מנקה אותו בעריכת שם. */
+.sticky-note-drag{ cursor: move; touch-action: none; }
+/* מרווח בין הכפתורים: הם קטנים, וצמודים זה לזה קשה לפגוע בהם באצבע.
+   גובה הכותרת **כן** משתנה — היא גולשת לשתי שורות בפתק צר — וזה בסדר:
+   הגוף הוא ``flex: 1 1 auto`` ולוקח את מה שנשאר, ולא ``calc(100% - 42px)``
+   כפי שהיה כאן קודם. */
+.sticky-note-actions{ display:flex; gap:10px; }
+.sticky-note-btn{ border:none; background: transparent; cursor: pointer; font-size: 16px; padding: 0 3px; min-width: 22px; transition: background-color .18s ease, color .18s ease; }
 .sticky-note-pin{ opacity:.8; }
 .sticky-note-pin:hover{ opacity:1; }
 .sticky-note-pin.is-active{
@@ -37,7 +98,12 @@
 .sticky-note-btn:hover{ color:#000; }
 
 .sticky-note-content{
-  width: 100%; height: calc(100% - 42px);
+  width: 100%;
+  /* ``flex: 1`` במקום ``calc(100% - 42px)``: הגוף לוקח את מה שנשאר אחרי
+     הכותרת, יהיה גובהה אשר יהיה. ``min-height: 0`` הכרחי — בלעדיו פריט
+     flex לא מתכווץ מתחת לגודל התוכן שלו, וטקסט ארוך היה מותח את הפתק. */
+  flex: 1 1 auto;
+  min-height: 0;
   border: 0; outline: none; resize: none;
   padding: 8px; font-size: 14px; line-height: 1.35;
   background: transparent; color: #222;
@@ -61,7 +127,6 @@
 .sticky-note-fab:hover{ transform: scale(1.05); }
 
 @media (max-width: 480px){
-  .sticky-note-drag{ height: 20px; }
   .sticky-note-fab{ left: 4px; bottom: 14px; }
 }
 
@@ -71,4 +136,399 @@
 /* Print: hide notes */
 @media print{
   .sticky-note, .sticky-note-fab{ display:none !important; }
+}
+
+/* ---------- צ'קבוקסים בתוך פתק ---------- */
+
+/* התצוגה היא בדיוק אותו ארגז כמו ה-textarea שהיא מחליפה, כולל גלילה
+   פנימית: פתק שגדל לבד מזיז את מה שסביבו.
+   (היסטוריה: פעם ``flex: 1`` כאן לא עשה כלום, כי ``.sticky-note`` לא היה
+   קונטיינר flex — ואז לתצוגה לא היה גובה משלה כלל. היום הוא כן, וזה מה
+   שמחזיק את הגובה.) */
+.sticky-note-tasks {
+  width: 100%;
+  /* אותו ארגז בדיוק כמו ה-textarea שהיא מחליפה. ראו שם. */
+  flex: 1 1 auto;
+  min-height: 0;
+
+  overflow-y: auto;
+  padding: 8px;
+  font-size: 14px;
+  line-height: 1.35;
+  color: #222;
+  cursor: text;          /* הרמז שאפשר ללחוץ ולחזור לעריכה */
+  white-space: pre-wrap;
+  /* ``word-break: break-word`` הוצא משימוש ב-CSS Text 3 (csswg-drafts#4087)
+     ו-stylelint מסמן אותו. ``overflow-wrap: anywhere`` הוא התחליף שמשמר
+     את ההתנהגות המדויקת, כולל ההשפעה על הגודל הפנימי המינימלי. */
+  overflow-wrap: anywhere;
+}
+
+.sticky-note-tasks[hidden] { display: none; }
+.sticky-note.is-minimized .sticky-note-tasks{ display:none; }
+
+/* שורה שאינה משימה — הטקסט הרגיל של הפתק. היא נשארת גלויה, וזה כל
+   ההבדל בין "יש כאן צ'קבוקס" לבין "כל שאר הפתק נעלם". */
+.sticky-task-line { min-height: 1.35em; }
+
+.sticky-task {
+  display: flex;
+  align-items: flex-start;
+  gap: .4rem;
+  padding: .1rem 0;
+}
+
+.sticky-task-box { margin-top: .25rem; flex: 0 0 auto; cursor: pointer; }
+
+.sticky-task-box:checked + .sticky-task-text {
+  text-decoration: line-through;
+  opacity: .6;
+}
+
+.sticky-task-box[disabled] { cursor: progress; }
+
+.sticky-note.is-task-pending { opacity: .85; }
+
+/* ---------- מארקדאון קליל בפתקים ---------- */
+/* כל צבע נגזר מ-``--note-ink``/``--note-ink-muted`` שכבר מוגדרים על
+   ``.sticky-note`` — דיו קבוע, בלתי תלוי בערכה, בדיוק כמו שם הפתק. */
+
+/* אינליין */
+.sticky-md-bold   { font-weight: 700; }
+.sticky-md-italic { font-style: italic; }
+.sticky-md-strike { text-decoration: line-through; opacity: .7; }
+.sticky-md-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .92em; direction: ltr; unicode-bidi: embed;
+  background: color-mix(in srgb, var(--note-ink, #2b3f6a) 12%, transparent);
+  padding: .05em .3em; border-radius: 4px;
+}
+.sticky-md-link { color: var(--note-ink, #2b3f6a); text-decoration: underline; }
+
+/* ``==מרקר==``.
+ *
+ * **חריגה מכוונת מדפוס הבית.** שאר אלמנטי המארקדאון כאן נגזרים
+ * מ-``--note-ink`` ב-``color-mix``, אבל מדידה הראתה שזה נכשל דווקא כאן:
+ * ``color-mix(ink 20%)`` יוצא ``#d5d9b8`` — מרחק 60 בלבד מרקע הפתק
+ * (``#FFFFCC``), ומרחק 24 מרקע הקוד האינליני (``#e6e8c0``). כלומר מרקר
+ * שבקושי נראה, ושמתבלבל עם ``code``. הגוון שנבחר נותן 112 ו-93.
+ *
+ * **למה דווקא ``#ff8fc4`` ולא ורוד רך.** ורוד בהיר (``#ffb3d1``) נבלע
+ * בצהוב של הנייר — בליטות 76 בלבד. ורוד רווי יותר בולט, אבל מתחתיו
+ * הניגודיות מול הדיו צונחת: ``#ff7fb8`` כבר ב-4.44:1, מתחת לסף AA.
+ * ``#ff8fc4`` הוא הגבול. הערך בפועל הוא ``#ff9ac9`` — אותו גוון
+ * מולבן, שמרכך את הבליטות מ-112 ל-101 ומשפר את הניגודיות
+ * ל-5.30:1. עדיין הרבה מעל ה-76 של ורוד רך שנבלע בנייר.
+ *
+ * הצבע יושב בטוקן רכיב (Level 3), אבל **לא כדי שערכה תדרוס אותו** —
+ * ההפך: ה-``!important`` למטה קיים בדיוק כדי לחסום ערכות, כי הנייר של
+ * הפתק קבוע וכל צבע שיירש מהערכה יוצא שגוי (ראו ההערה בראש הקובץ).
+ * הטוקן הוא מקום אחד ומוסמך לערך, בצורה ש-``theming_and_css`` מגדיר
+ * לצבע ייחודי לרכיב — ערך ברירת המחדל חי ברכיב עצמו.
+ */
+.sticky-note { --sticky-mark-bg: #ff9ac9; --sticky-mark-line: #df76a8; }
+.sticky-md-mark {
+  /* **``!important`` כאן אינו עצלנות — הוא הדרך היחידה שנשארה.**
+   * לאפליקציה יש כללי ערכה שמכוונים ל-``mark`` כאלמנט:
+   * ``mark { color: #FFFFFF }`` ו-``:root[data-theme="classic"] mark``.
+   * הצורה השנייה היא (0,2,1) בספציפיות, כלומר היא מנצחת כל בורר מחלקה
+   * סביר של הרכיב — וכל ניסיון לנצח אותה בשרשור מחלקות היה קושר את
+   * הכלל למבנה ה-DOM ונשבר בעריכה הבאה.
+   *
+   * הכשל שזה מונע נמדד: לבן על המרקר הוא **1.51:1** — בלתי קריא. זו
+   * בדיוק המחלקה שההערה בראש הקובץ מתעדת (שם הפתק ב-1.03:1), ומאותה
+   * סיבה: רקע הפתק קבוע, ולכן טקסט שיורש מהערכה יוצא שגוי.
+   */
+  background: var(--sticky-mark-bg, #ff9ac9) !important;
+  color: var(--note-ink, #2b3f6a) !important;
+
+  /* **הקו התחתון נדרס, לא מאופס.** ``markdown-enhanced.css`` נותן לכל
+   * ``mark`` קו ענברי (``1.5px solid #FFBF00``) שאינו שייך לפלטת הפתק.
+   * הוא לא בוטל אלא הוחלף בגוון כהה של המרקר עצמו: הקו הוא מה שנותן את
+   * מראה משיחת המרקר, וגם מה שסוגר את הקופסה מלמטה. */
+  border-bottom: 2px solid var(--sticky-mark-line, #df76a8) !important;
+
+  /* **אותן מידות בדיוק כמו ``.sticky-md-code``, וזו החלטה שנמדדה.**
+   *
+   * הניסיון הראשון היה ``padding: .14em .18em`` עם ``margin: -.14em 0``.
+   * שתי ההנחות שם היו שגויות:
+   *
+   * 1. **המרג'ין לא עשה כלום.** מרג'ין אנכי על אלמנט inline אינו משתתף
+   *    בחישוב תיבת השורה. נמדד: גובה המרקר 21.1px איתו ובלעדיו, וגובה
+   *    המכל 44.6px בשני המקרים.
+   * 2. **הריפוד האנכי גולש לשורות השכנות.** הוא מצויר אבל אינו מגדיל את
+   *    תיבת השורה. בפתק תיבת השורה היא 17px סביב גופן של 14px, כלומר
+   *    תקציב של פחות מ-1.5px לכל צד — ובגודל הזה כל ריפוד גולש:
+   *    ``.05em`` נותן מרווח של ‎-0.4px בין מרקרים בשורות עוקבות.
+   *
+   * **מה שקונה את הריפוד הוא דווקא ``font-size: .92em``.** זה בדיוק מה
+   * שהקוד האינליני עושה, וזו הסיבה שהוא מסתדר עם ריפוד ואנחנו לא:
+   * גופן קטן יותר מפנה מקום בתוך אותה תיבת שורה. נמדד:
+   *
+   *   ריפוד 0, גופן מלא          → גובה 16.2, מרווח +0.8
+   *   ריפוד .05em, גופן מלא      → גובה 17.4, מרווח ‎-0.4  ✗
+   *   ריפוד .05em, גופן .92em    → גובה 16.5, מרווח +0.5  ✓
+   *   ``code`` לשם השוואה        → גובה 14.7, מרווח +2.3
+   *
+   * הגופן עצמו **אינו** מוחלף למונוספייס — רק המידות. ההבדל בגודל כמעט
+   * אינו מורגש, בדיוק כפי שהוא אינו מורגש בקוד האינליני. */
+  font-size: .92em;
+  padding: .05em .3em;
+  border-radius: 2px;
+}
+.sticky-md-link:hover { text-decoration-thickness: 2px; }
+
+/* כותרות — גודל ומשקל, בלי קפיצות ענק שיאכלו את הפתק הקטן */
+.sticky-md-h { font-weight: 700; line-height: 1.25; margin: .15em 0 .05em; }
+.sticky-md-h1 { font-size: 1.25em; }
+.sticky-md-h2 { font-size: 1.12em; }
+.sticky-md-h3 { font-size: 1.02em; opacity: .9; }
+
+/* ציטוט — קו בצד והזחה קטנה */
+.sticky-md-quote {
+  border-inline-start: 3px solid color-mix(in srgb, var(--note-ink, #2b3f6a) 40%, transparent);
+  padding-inline-start: .5rem;
+  color: var(--note-ink-muted, #66739A);
+  font-style: italic;
+}
+
+/* קו מפריד */
+.sticky-md-hr { padding: .2em 0; }
+.sticky-md-rule {
+  border: 0; height: 1px;
+  background: color-mix(in srgb, var(--note-ink, #2b3f6a) 30%, transparent);
+  margin: 0;
+}
+
+/* רשימה — תבליט/מספר בצד, גוף מוזח */
+.sticky-md-li { display: flex; align-items: flex-start; gap: .35rem; }
+.sticky-md-bullet {
+  flex: 0 0 auto; color: var(--note-ink-muted, #66739A);
+  font-variant-numeric: tabular-nums; min-width: 1.1em;
+}
+.sticky-md-li-body { flex: 1 1 auto; min-width: 0; }
+
+/* בלוק קוד — כל שורה מונו, ורצף שורות מקבל רקע משותף.
+   הגדר עצמה (``\`\`\``) נשארת גלויה, כי כל שורת מקור היא שורת תצוגה. */
+.sticky-md-pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .88em; direction: ltr; unicode-bidi: embed;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  background: color-mix(in srgb, var(--note-ink, #2b3f6a) 8%, transparent);
+  padding: 0 .45rem;
+}
+.sticky-md-pre.is-fence { color: var(--note-ink-muted, #66739A); }
+/* פינות עגולות בקצות הרצף */
+/* פינות עגולות בגדר הפותחת: או ראשונה בתצוגה, או אחרי שורה שאינה
+   ``.sticky-md-pre`` (כלומר תחילת רצף קוד). הסלקטור הקודם היה
+   ``:not(.sticky-md-pre)`` על אלמנט שהוא-עצמו ``.sticky-md-pre`` —
+   בלתי אפשרי, ולכן לא חל לעולם. */
+.sticky-md-pre.is-fence:first-child,
+:not(.sticky-md-pre) + .sticky-md-pre.is-fence { border-radius: 6px 6px 0 0; }
+
+
+/* חיווי כשל — כתיבה שלא נקלטה חייבת להיראות, לא להיעלם בשקט */
+.sticky-note.has-task-error {
+  outline: 2px solid #dc3545;
+  outline-offset: 1px;
+}
+
+/* חיווי אורך — התקרה נאכפת בשרת בחיתוך שקט, ולכן היא חייבת להיראות כאן */
+.sticky-note-warn {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 4px 8px;
+  font-size: 12px; line-height: 1.3;
+  background: #dc3545; color: #fff;
+}
+
+/* כשל שמירה — עד היום הוא היה ב-console בלבד */
+.sticky-note.has-save-error,
+.sticky-note.has-length-error {
+  outline: 2px solid #dc3545;
+  outline-offset: 1px;
+}
+
+/* כפתור מושבת — נראה, אבל חלש.
+ *
+ * ``opacity: .3`` הרכיב את הגלף על הכותרת והוריד אותו ל-1.96:1 — כלומר
+ * הכפתור נעלם לגמרי, והמרווח שהוא תופס נראה כמו חור מקרי בשורה. עכשיו
+ * הוא מקבל צבע משלו: קיים על המסך, וברור שאינו פעיל. */
+.sticky-note-btn[disabled] { color: var(--note-ink-muted); cursor: default; }
+
+/* חיווי העתקה. כשל חייב להיראות, לא רק הצלחה. */
+.sticky-note-copy.is-copy-done { background: #d1fae5; color: #065f46; border-radius: 6px; }
+.sticky-note-copy.is-copy-fail { background: #fee2e2; color: #b91c1c; border-radius: 6px; }
+
+/* שם הפתק — בצד השני של שורת הכפתורים, וגלוי גם במיזעור.
+   זו כל הסיבה שהוא בכותרת ולא בגוף: פתק ממוזער מציג רק את השורה הזו. */
+.sticky-note-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--note-ink);
+  padding: 0 4px;
+  text-overflow: ellipsis;
+}
+/* גם ה-placeholder — ``opacity`` עליו הייתה מחזירה אותנו בדיוק לבעיה
+   שהכפתור המושבת סבל ממנה. */
+.sticky-note-title::placeholder { font-weight: 400; color: var(--note-ink-muted); opacity: 1; }
+/* פוקוס נראה לעין. רקע ב-5% אינו חיווי — הוא כמעט בלתי נראה על צהוב,
+   וזה שדה עריכה שמגיעים אליו ב-Tab. ``outline`` אמיתי, בלי לבטל אותו. */
+.sticky-note-title:focus-visible,
+.sticky-note-title:focus {
+  outline: 2px solid #1d4ed8;
+  outline-offset: 1px;
+  background: rgba(255, 255, 255, .55);
+  border-radius: 4px;
+}
+.sticky-note-title.is-duplicate { color: #b91c1c; text-decoration: underline wavy #dc3545; }
+
+/* הכותרת היא flex, וכעת יש בה שלושה חלקים: כפתורים, ידית גרירה, ושם.
+ *
+ * **הבעיה שנמדדה:** שישה כפתורים בני 26 פיקסלים ועוד חמישה רווחים של 10
+ * הם 190 פיקסלים קשיחים. פתק ברירת המחדל במובייל הוא 200, ובדסקטופ 260 —
+ * כלומר לשם נשארו 8 ו-16 פיקסלים בהתאמה, ובמובייל הכותרת אף חרגה מהפתק
+ * ב-44 פיקסלים ו-``overflow: hidden`` חתך כפתורים. (החריגה קדמה לשם:
+ * היא נכנסה עם כפתורי הביטול וההעתקה, ורק השם הפך אותה לגלויה.)
+ *
+ * **הפתרון:** ``min-width`` אמיתי לשם + ``flex-wrap`` על הכותרת. כשאין
+ * מקום לשלושתם בשורה אחת, השם יורד לשורה שנייה ומקבל את כל הרוחב. אין
+ * כאן שאילתת מדיה, כי הקובע הוא רוחב **הפתק** ולא רוחב המסך — פתק צר
+ * במסך רחב סובל בדיוק מאותה בעיה. */
+.sticky-note-header { gap: 6px; }
+.sticky-note-actions { flex: 0 0 auto; }
+
+/* ידית הגרירה **מכילה** את השם ואת כפתור העיפרון, ותופסת את כל מה
+   שנשאר בכותרת. נמדד לפני: הידית הייתה 24px קבועים ושדה השם תפס
+   218px–635px לפי גודל הפתק — כלומר 1%-3% מהכותרת נגררו, בעוד
+   ש-``cursor: move`` הבטיח את כולה. */
+.sticky-note-drag {
+  flex: 1 1 auto;
+  min-width: 40px;
+  height: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sticky-note-title { flex: 1 1 60px; min-width: 60px; }
+
+/* **זה מה שמחזיר את שטח הגרירה.** שדה נעול אינו בולע את האירוע, והוא
+   נופל דרכו אל הידית שמתחתיו. */
+.sticky-note-title[readonly] {
+  pointer-events: none;
+  cursor: move;
+  user-select: none;
+}
+
+/* בעריכה השדה חייב לקבל מגע בחזרה — ``touch-action: none`` של הידית
+   חוסם מיקום סמן במובייל.
+   הכלל הזה עבד רק אחרי ש-``_enableDrag`` הפסיק להציב ``touchAction``
+   כסגנון inline: inline גובר על גיליון סגנונות, ולכן ההצהרה כאן בוטלה
+   בשקט. נמדד בכרומיום — הערך נשאר ``none`` גם עם המחלקה.
+
+   **הכלל מנקה את האב, וזה מה שגורם לו לעבוד.** ``touch-action`` נחתכת
+   עם האבות, ולכן ``auto`` על ה-``input`` עצמו לא היה מועיל כלום כל עוד
+   ``.sticky-note-drag`` שמעליו נשאר ``none``. מאותה סיבה אסור להצהיר
+   ``none`` על ``.sticky-note-header`` — היא אב של השדה הזה, והייתה
+   מבטלת את השורה הזו בשקט. ראו את ההסבר אצל ``.sticky-note-drag``. */
+.sticky-note.is-editing-title .sticky-note-drag { touch-action: auto; cursor: default; }
+.sticky-note.is-editing-title .sticky-note-title { background: rgba(255, 255, 255, .55); border-radius: 4px; }
+
+/* העיפרון קטן ולא גוזל מקום משורת הפעולות — הוא שייך לשם, לא להן */
+.sticky-note-edit-title { font-size: 13px; min-width: 18px; padding: 0 2px; opacity: .75; }
+.sticky-note-edit-title:hover { opacity: 1; }
+.sticky-note.is-editing-title .sticky-note-edit-title {
+  opacity: 1;
+  color: var(--note-ink);
+  background: rgba(43, 63, 106, .12);
+  border-radius: 5px;
+}
+
+/* ── טבלאות מארקדאון בפתק ──────────────────────────────────────────
+   העטיפה היא שנגללת, לא הטבלה: ``.sticky-note-tasks`` הוא
+   ``overflow-y: auto`` בלבד, ולכן טבלה רחבה הייתה דוחפת את הפתק. זה גם
+   מה שמנטרל את הנימוק המקורי להחרגת טבלאות ("רחבות מדי לפתק").
+
+   **בלי ``scrollbar-gutter: stable``.** הכלל ההוא נוגע לפס גלילה **אנכי**,
+   שב-RTL יושב משמאל ומזיז תוכן כשהוא מופיע. העוטף כאן גולל אופקית בלבד,
+   ופס הגלילה שלו יושב למטה ואינו מזיז דבר לצדדים — ונמדד שהוא גוזל
+   15px מהרוחב השמיש של כל טבלה תמורת גאטר שלעולם אינו מתמלא. */
+.sticky-md-table-wrap {
+  overflow-x: auto;
+  margin-block: .3em;
+}
+
+.sticky-md-table {
+  border-collapse: collapse;
+  /* ``max-content`` בלי ``max-width``: טבלה צרה לא נמתחת לרוחב הפתק,
+     ורחבה שומרת על צורתה ונגללת בתוך העטיפה. ``max-width: 100%`` היה
+     חוסם בדיוק את זה — הטבלה הייתה נדחסת לרוחב הפתק והעמודות מתמעכות,
+     וזה נמדד. */
+  width: max-content;
+  font-size: .95em;
+}
+
+/* תכונות לוגיות ולא פיזיות — הן מתהפכות מאליהן ב-RTL. */
+.sticky-md-cell {
+  border: 1px solid var(--note-ink-muted, #66739A);
+  padding-block: .18em;
+  padding-inline: .45em;
+  /* הקונטיינר הוא ``pre-wrap``; בתא זה היה משמר רווחי יישור מהמקור. */
+  white-space: normal;
+  vertical-align: top;
+}
+
+.sticky-md-table thead .sticky-md-cell {
+  font-weight: 700;
+  /* ``color-mix`` נמנע בכוונה: הפתקים הם חריג מתועד מערכת הנושא ואין להם
+     טוקן רקע משלהם, ולכן ההדגשה היא במשקל ובשקיפות ולא בצבע חדש. */
+  background: rgba(0, 0, 0, .045);
+}
+
+/* התאים נושאים ``dir="auto"`` מה-JS: הדפדפן מכריע כיוון לפי התו החזק
+   הראשון, ולכן תא עברי נשאר RTL ותא של מספר או מזהה קוד מוצג LTR.
+   ``text-align: start`` מתיישר לפי הכיוון שהוכרע לתא, ולא לפי הפתק. */
+.sticky-md-cell { text-align: start; }
+
+/* ── כתב יד ─────────────────────────────────────────────────────────
+   מחלקה **אחת** לשלושת המשטחים (לוח, קובץ md, דפדפן הריפו), כי המראה
+   זהה בכולם ושתי מחלקות עם אותם כללים היו נסחפות זו מזו. שני מקורות
+   מחילים אותה: ההגדרה שבעמוד ההגדרות, והמתג שלכל לוח.
+
+   היא יושבת על ``<html>`` ולא על מכל הפתקים, כי היא מוחלת בסקריפט
+   שרץ בפרסור ה-``head`` — שם ``document.body`` עדיין ``null``. הבחירה
+   בשורש גם מכסה פתק במצב ``screen``, שיושב מחוץ למכל.
+
+   ``cursive`` כגיבוי הוא מה ש-Google Fonts ממליץ למשפחה הזו, והוא גם
+   מה שיוצג אם הגופן לא נטען: כתב מחובר כלשהו, ולא קפיצה ל-Heebo. */
+.sticky-handwriting .sticky-note-content,
+.sticky-handwriting .sticky-note-tasks,
+.sticky-handwriting .sticky-note-title {
+  font-family: 'Gveret Levin', cursive;
+}
+
+/* **אין כאן ``font-size``, וזו החלטה שנמדדה.**
+
+   הגרסה הראשונה הגדילה את המכל ב-``1.08em`` בנימוק שהגופן "צר ונמוך".
+   שתי הבדיקות הפריכו את הנימוח ואת המימוש כאחד: באותו ``font-size`` שני
+   הגופנים נותנים **גובה זהה** והגופן רק צר יותר — כלומר ההגדלה פיצתה על
+   רוחב בכלי שמשנה גובה. וגרוע מכך, ``em`` ב-``font-size`` נפתר מול
+   **ההורה** ולא מול הבסיס של האלמנט, ולכן ``1.08em`` החליף את
+   ``font-size: 14px`` של המכל ב-``16px × 1.08 = 17.28px`` — הגדלה של 23%
+   במקום 8%, שגררה איתה גם את בלוקי הקוד מ-12.32px ל-15.21px.
+
+   בלי ההגדלה, גודל הטקסט וגודל הקוד זהים למצב הרגיל, ואין מה לנטרל. */
+
+/* ``font-family`` על הקוד הוא הגנה עתידית בלבד: ל-``.sticky-md-code``
+   ול-``.sticky-md-pre`` כבר יש הצהרה משלהם, והצהרה על האלמנט תמיד גוברת
+   על ערך שעובר בירושה — ספציפיות של האב אינה נכנסת למשוואה. נבדק בדפדפן
+   בנטרול הכלל בזמן ריצה: הקוד נשאר ``ui-monospace`` באותו גודל. */
+.sticky-handwriting .sticky-md-code,
+.sticky-handwriting .sticky-md-pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }

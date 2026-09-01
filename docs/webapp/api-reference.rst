@@ -1,5 +1,6 @@
 WebApp API Reference
 ====================
+:summary: רפרנס ה-API של ה-WebApp: ה-endpoints, זרימת האימות מול Telegram, מבנה התשובה, וקודי השגיאה הנפוצים.
 
 Endpoints
 ---------
@@ -79,6 +80,18 @@ Endpoints
      - ✅
      - -
      - HTML (rendered)
+   * - ``/svg/<id>``
+     - GET
+     - תצוגת SVG מרונדרת, עם החלפת רקע
+     - ✅
+     - -
+     - HTML
+   * - ``/raw_svg/<id>``
+     - GET
+     - ה-SVG הגולמי עבור ה-``<img>`` שבעמוד התצוגה
+     - ✅
+     - -
+     - ``image/svg+xml``
    * - ``/api/sticky-notes/reminders/summary``
      - GET
      - סיכום מינימלי לבועה הקבועה (האם יש פתקים ממתינים + מונה)

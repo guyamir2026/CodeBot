@@ -1,8 +1,14 @@
 משתני סביבה - רפרנס
 =====================
+:summary: רפרנס משתני הסביבה: הטבלה המרכזית, משתני התראות וניטור, מדדים ו-OTEL, תפעול ואינטגרציות, דגלי בדיקות, ודוגמאות קונפיגורציה כולל טבלת ה-Scopes של GitHub.
 
 .. note::
    בכל פעם שמוסיפים או משנים משתני סביבה בקוד/Infra **חייבים** לעדכן עמוד זה (רפרנס משתני הסביבה) וכן לציין זאת ב-PR. בכך אנו מבטיחים שהמידע הופך ל-Single Source of Truth גם למפתחים וגם לאנשי DevOps.
+
+.. seealso::
+   :doc:`webapp/config-inspector` — כלי האדמין שמציג את המשתנים בזמן ריצה. שם מתועדים
+   גם הכללים להוספת משתנה: איך קובעים לאיזה שירות הוא שייך, איך נמנעים מסטטוס
+   ``Modified`` שגוי, ומה צריך לתעד כשמשתנה משרת כמה שירותים.
 
 טבלה מרכזית
 ------------
@@ -17,11 +23,11 @@
      - דוגמה
      - רכיב
    * - ``BOT_TOKEN``
-     - טוקן הבוט מ-BotFather
+     - טוקן הבוט מ-BotFather (נדרש גם ב-WebApp לאימות Telegram Login)
      - כן
      - -
      - ``123456:ABC-DEF...``
-     - Bot
+     - Bot/WebApp
    * - ``MONGODB_URL``
      - חיבור ל-MongoDB
      - כן
@@ -107,11 +113,11 @@
      - ``my_db``
      - Bot/WebApp
    * - ``SECRET_KEY``
-     - מפתח הצפנה ל-Flask/WebApp
-     - כן (WebApp)
+     - מפתח הצפנה ל-Flask/WebApp. **בשירות ה-MCP (מצב OAuth):** חותם ומאמת את זהות המשתמש בין הוובאפ ל-MCP (``/oauth/identify`` → ``/oauth/consent``). **חייב להיות ערך אקראי וחזק, זהה בין הוובאפ לשירות ה-MCP.** מצב OAuth יסרב לעלות עם ערך ריק או עם ברירת המחדל של הפיתוח (מונע זיוף זהות).
+     - כן (WebApp; ובמצב OAuth גם MCP)
      - -
      - ``supersecretkey123``
-     - WebApp
+     - MCP/WebApp
    * - ``BOT_USERNAME``
      - שם משתמש הבוט
      - לא
@@ -191,11 +197,11 @@
      - ``my_webhook_secret``
      - WebApp
    * - ``REPO_MIRROR_PATH``
-     - נתיב בסיסי בדיסק לשמירת Bare Mirror של הריפו (Repo Sync Engine)
+     - נתיב בסיסי בדיסק לשמירת Bare Mirror של הריפו (Repo Sync Engine). נדרש גם בשירות ה-MCP עבור כלי דפדפן הריפו (אדמין בלבד) — השירות חייב דיסק עם ה-mirrors (ב-Render דיסק הוא פר-שירות).
      - לא
      - ``/var/data/repos``
      - ``/var/data/repos``
-     - WebApp
+     - MCP/WebApp
    * - ``REPO_NAME``
      - שם ריפו לוגי לשימוש ב-Repo Sync (מפתח ל-mirror בדיסק ול-metadata ב-DB)
      - לא
@@ -203,11 +209,11 @@
      - ``CodeBot``
      - WebApp
    * - ``WEBAPP_URL``
-     - כתובת ה-WebApp
+     - כתובת ה-WebApp. בשירות ה-MCP: משמש גם לגשר זהות OAuth (``/oauth/identify``) — מדליק מצב OAuth יחד עם ``MCP_SERVER_URL``.
      - לא
      - -
      - ``https://my.app``
-     - WebApp
+     - WebApp/MCP
    * - ``BOT_JOBS_API_BASE_URL``
      - בסיס URL ל-API הפנימי של הבוט (aiohttp) עבור Trigger של Jobs ממסך המוניטור (``POST /api/jobs/<job_id>/trigger``). אם לא מוגדר, כפתור ההפעלה ידנית במוניטור יהיה לא זמין.
      - לא
@@ -407,11 +413,17 @@
      - ``14``
      - WebApp
    * - ``ADMIN_USER_IDS``
-     - מזהי משתמש טלגרם עם הרשאות אדמין (CSV)
+     - מזהי משתמש טלגרם עם הרשאות אדמין (CSV). **גם ה-MCP** נשען עליו: ``require_admin`` שומר בעזרתו על כלי הריפו
      - לא
      - "" (ריק)
      - ``123,456``
-     - Bot/WebApp
+     - Bot/WebApp/MCP
+   * - ``BLOCKED_USER_IDS``
+     - מזהי משתמשים חסומים מהבוט (CSV). רשת ביטחון שמנוהלת כאן בלבד — לא ניתן לשחרר ממנה דרך ``/unban``, בשונה מהחסימות שבבסיס הנתונים. אדמינים לעולם אינם נחסמים, גם אם מזהה שלהם מופיע כאן
+     - לא
+     - "" (ריק)
+     - ``123,456``
+     - Bot
    * - ``DB_HEALTH_TOKEN``
      - טוקן להגנה על נתיבים פנימיים רגישים בשרת ה-aiohttp: ``/api/db/*`` וגם ``/api/jobs/*`` (נשלח כ-``Authorization: Bearer <token>``). ללא טוקן ה-API חסום (403) והדשבורד ``/db-health`` יחזיר 403.
      - כן (DB Health)
@@ -599,11 +611,11 @@
      - ``true``
      - WebApp
    * - ``REDIS_URL``
-     - חיבור ל-Redis (cache)
+     - חיבור ל-Redis. **שני צרכנים, משתנה אחד:** הקאש (בכל השירותים), ובנוסף — ב-WebApp בלבד — אחסון ה-rate limiter. בלעדיו הקאש מושבת לגמרי, וה-limiter נופל ל-``memory://``: המונים נספרים לכל gunicorn worker בנפרד ומתאפסים בכל דיפלוי
      - לא
      - -
      - ``redis://localhost:6379``
-     - Bot
+     - Bot/WebApp/MCP
    * - ``REDIS_CONNECT_TIMEOUT``
      - Timeout התחברות ל-Redis (שניות)
      - לא
@@ -623,9 +635,9 @@
      - ``true``
      - Bot/WebApp
    * - ``CACHE_ENABLED``
-     - הפעלת קאש פנימי
+     - הפעלת קאש פנימי. דורש ``REDIS_URL``; ``false`` מכבה את הקאש בלי למחוק את הכתובת
      - לא
-     - ``false``
+     - ``true``
      - ``true``
      - Bot/WebApp
    * - ``CACHE_CLEAR_BUDGET_SECONDS``
@@ -844,6 +856,12 @@
      - ``CodeBot``
      - ``CKB``
      - Bot/WebApp
+   * - ``CUSTOM_EMOJI_ZIP_ID``
+     - Custom emoji ID לאייקון ZIP בהודעות הבוט (טלגרם פרימיום, לבעל בוט עם מנוי); ריק = אימוג'י רגיל 📁.
+     - לא
+     - (ללא)
+     - ``5069094945915142952``
+     - Bot
    * - ``DRIVE_ADD_HASH``
      - הוספת hash לקבצים משותפים
      - לא
@@ -911,11 +929,11 @@
      - ``srv-xxxx``
      - Reporter
    * - ``ENABLE_INTERNAL_SHARE_WEB``
-     - הפעלת שירות שיתוף פנימי
+     - הפעלת שירות שיתוף פנימי בתוך תהליך הבוט (נקרא ב-main.py; היסטורי — ההרצה הפנימית בוטלה וה-webserver רץ כשירות נפרד)
      - לא
      - ``false``
      - ``true``
-     - WebApp
+     - Bot
    * - ``PORT``
      - פורט להרצת שירותים פנימיים/בדיקות
      - לא
@@ -1157,13 +1175,13 @@
      - לא
      - "" (ריק)
      - ``secret123``
-     - WebApp
+     - Webserver
    * - ``SENTRY_WEBHOOK_DEDUP_WINDOW_SECONDS``
      - חלון דה-דופליקציה (בשניות) להתראות Sentry שמגיעות ב-Webhook כדי למנוע burst (``0`` מנטרל).
      - לא
      - ``300``
      - ``600``
-     - WebApp
+     - Webserver
    * - ``ALERTMANAGER_IP_ALLOWLIST``
      - רשימת IPs (מופרדים בפסיק) שמורשים לצרוך את ה-webhook; נבדק מול ``X-Forwarded-For``/``remote_addr``.
      - לא
@@ -1771,13 +1789,25 @@
      - לא
      - ``mongo``
      - ``fs``
-     - Bot/WebApp
+     - Bot
    * - ``BACKUPS_DIR``
      - נתיב גיבויים בלוקאל (אם ``BACKUPS_STORAGE=fs``); אחרת נבחר אוטומטית.
      - לא
      - נתיב ברירת מחדל (``/app/backups``)
      - ``/var/lib/codebot/backups``
-     - Bot/WebApp
+     - Bot
+   * - ``SKILLS_MAX_PER_USER``
+     - מכסת מספר סקילים מרבי למשתמש (``0`` = בלי מגבלה); לסקילים אין retention.
+     - לא
+     - ``100``
+     - ``50``
+     - Bot
+   * - ``SKILLS_MAX_TOTAL_BYTES``
+     - מכסת נפח סקילים כוללת למשתמש בבייטים (``0`` = בלי מגבלה).
+     - לא
+     - ``1073741824`` (1GB)
+     - ``536870912``
+     - Bot
    * - ``BACKUPS_SHOW_ALL_IF_EMPTY``
      - כאשר ``true`` מאפשר לממשק להציג את כל הקבצים גם כשאין פילטר (שימושי ל-ops).
      - לא
@@ -1831,7 +1861,7 @@
      - לא
      - ``dummy_token``
      - ``test_token``
-     - Bot/WebApp
+     - Bot
    * - ``DRIVE_RESCHEDULE_BOOTSTRAP_DELAY``
      - כמה שניות להמתין לפני תחילת משימות ה-Drive rescheduler.
      - לא
@@ -2108,6 +2138,63 @@
      - ``""`` / ``code_keeper_bot``
      - ``mongodb://localhost:27017`` / ``my_db``
      - Scripts
+   * - ``MCP_SERVER_URL``
+     - ה-URL הציבורי (https) של שירות ה-MCP. בבוט: בניית פקודת ``/connect_claude``. בשירות ה-MCP: issuer של OAuth (מדליק מצב OAuth יחד עם ``WEBAPP_URL``). בוובאפ: שער open-redirect ב-``/oauth/identify``.
+     - לא
+     - ``https://YOUR-MCP-HOST``
+     - ``https://code-keeper-mcp.onrender.com``
+     - Bot/MCP/WebApp
+   * - ``MCP_SERVER_NAME``
+     - שם התצוגה של שרת ה-MCP (מוצג ללקוח כשם ה-Connector).
+     - לא
+     - ``CodeKeeper``
+     - ``CodeKeeper``
+     - MCP
+   * - ``MCP_DOCS_REPO``
+     - רשימת הריפואים המותרים (CSV allowlist) שכלי ``codekeeper_docs_get_section`` הציבורי רשאי לקרוא מהם קבצי RST. גבול אבטחה — ארגומנט ``repo`` שאינו ברשימה נדחה. ברירת מחדל ``CodeBot``.
+     - לא
+     - ``CodeBot``
+     - ``CodeBot``
+     - MCP
+   * - ``MCP_ALLOWED_HOSTS``
+     - רשימת Host מותרים לשרת ה-MCP (CSV; תומך wildcard כמו ``*.onrender.com``). ריק = הגנת DNS-rebinding כבויה (מתאים לשרת ציבורי מוגן-טוקן).
+     - לא
+     - "" (כבוי)
+     - ``codekeeper-mcp.onrender.com``
+     - MCP
+   * - ``MCP_ALLOWED_ORIGINS``
+     - רשימת Origin מותרים לשרת ה-MCP (CSV). רלוונטי רק כשמפעילים הגנה דרך ``MCP_ALLOWED_HOSTS``.
+     - לא
+     - ""
+     - ``https://claude.ai``
+     - MCP
+   * - ``MCP_REPO_DENYLIST_EXTRA``
+     - תבניות glob נוספות (CSV) ל-denylist הסודות של כלי דפדפן הריפו ב-MCP, מעל רשימת הבסיס המובנית (``.env*``, ``*.pem``, ``id_rsa*`` וכו'). ההתאמה case-insensitive על הנתיב המלא וה-basename.
+     - לא
+     - ""
+     - ``*.sqlite, private/*``
+     - MCP
+   * - ``MCP_REPO_AUTOSYNC``
+     - רענון אוטומטי של ה-mirrors המקומיים בשירות ה-MCP (thread רקע, כמו ה-worker בוובאפ): משכפל ריפו חסר מ-``repo_metadata.repo_url`` ומריץ fetch כשה-``last_synced_sha`` ב-Mongo שונה מהמקומי. ``0`` מכבה.
+     - לא
+     - ``1`` (פעיל)
+     - ``1``
+     - MCP
+   * - ``MCP_REPO_AUTOSYNC_INTERVAL``
+     - מרווח (שניות) בין מעברי הרענון של ה-autosync. מינימום 30.
+     - לא
+     - ``300``
+     - ``120``
+     - MCP
+
+.. note::
+
+   **הפריימר לסוכן** (``GET /api/agent/primer``) אינו מוסיף אף משתנה סביבה.
+   תקרת ה-24KB ומשך ה-cache (60 שניות) הם קבועים ב-``mcp_server/primer.py``
+   במכוון — התקרה היא תקציב מול חלון ההקשר של המודל ולא כוונון תפעולי, ומצב
+   הכשל של העלאתה בלתי-נראה (הקשר נאכל בשקט). שינוי דורש PR. תוכן הפריימר
+   נערך מהדפדפן ב-``/settings`` ונשמר ב-``user_preferences``, לא ב-ENV.
+   ראו :doc:`mcp-server`.
 
 דגלי בדיקות ופיתוח
 -------------------
